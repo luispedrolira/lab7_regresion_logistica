@@ -21,6 +21,10 @@ library(tidyverse)
 library(knitr)
 library(kableExtra)
 library(gridExtra)
+library(caret)
+library(pROC)
+library(car)
+library(broom)
 ```
 
 ```{r seed-global}
@@ -244,17 +248,300 @@ cat("Contiene: train_data, test_data, SEED_GLOBAL (=", SEED_GLOBAL, "), p33, p66
 
 ---
 
-# Resumen de Entregables P1
 
-| Entregable | Estado |
-|---|---|
-| `price` limpio y convertido a numérico | ✓ |
-| `es_caro` creado con umbrales justificados (p66) | ✓ |
-| `categoria_precio` creado con 3 niveles (p33/p66) | ✓ |
-| Balance de clases verificado en dataset completo | ✓ |
-| `splits.RData` exportado con train/test estratificado 75/25 | ✓ |
-| Balance de clases verificado en train y test | ✓ |
 
 **Seed global:** `r SEED_GLOBAL` — todos los integrantes deben usar `set.seed(42)`.
 
 **Percentil 33:** `r scales::dollar(p33)` | **Percentil 66:** `r scales::dollar(p66)`
+
+---
+
+# P2 — Actividades 3 y 4
+
+## Actividad 3 — Modelo Logístico Binario con Validación Cruzada
+
+### Carga de `splits.RData` 
+
+```{r cargar-splits-p2}
+load("splits.RData")
+
+cat("Splits cargados correctamente.\n")
+cat("Train:", nrow(train_data), "filas /", ncol(train_data), "columnas\n")
+cat("Test: ", nrow(test_data), "filas /", ncol(test_data), "columnas\n")
+cat("Seed global recibido:", SEED_GLOBAL, "\n")
+```
+
+### Selección de variables predictoras con criterio
+
+Se aplica el siguiente criterio para elegir predictores:
+
+1. Excluir variables objetivo y variables directamente derivadas de `price` para evitar fuga de información.
+2. Excluir posibles identificadores (`id`, `*_id`, etc.) porque no tienen valor predictivo generalizable.
+3. Excluir variables con más de 30% de valores faltantes.
+4. Excluir variables con varianza casi nula.
+5. Mantener variables numéricas para facilitar interpretación y diagnóstico de multicolinealidad con VIF.
+
+```{r seleccion-predictores}
+variables_excluir <- c("es_caro", "categoria_precio", "price", "price_num")
+
+vars_candidatas <- setdiff(names(train_data), variables_excluir)
+
+# 1) Excluir potenciales identificadores
+es_id <- grepl("(^id$|_id$|id$|^listing_id$|^host_id$|^scrape_id$)",
+               vars_candidatas,
+               ignore.case = TRUE)
+vars_sin_id <- vars_candidatas[!es_id]
+
+# 2) Excluir variables con demasiados NA (>30%)
+prop_na <- sapply(train_data[vars_sin_id], function(x) mean(is.na(x)))
+vars_bajo_na <- names(prop_na[prop_na <= 0.30])
+
+# 3) Excluir variables de varianza casi nula
+if (length(vars_bajo_na) > 0) {
+  nzv_info <- caret::nearZeroVar(train_data[vars_bajo_na], saveMetrics = TRUE)
+  vars_no_nzv <- rownames(nzv_info)[!nzv_info$nzv]
+} else {
+  vars_no_nzv <- character(0)
+}
+
+# 4) Mantener variables numéricas
+vars_predictoras <- vars_no_nzv[sapply(train_data[vars_no_nzv], is.numeric)]
+
+if (length(vars_predictoras) < 3) {
+  stop("Se seleccionaron menos de 3 predictores. Revisa el criterio de filtrado.")
+}
+
+cat("Número de predictores seleccionados:", length(vars_predictoras), "\n")
+cat("Predictores seleccionados:\n")
+print(vars_predictoras)
+```
+
+```{r tabla-criterio-vars}
+resumen_seleccion <- tibble(
+  etapa = c(
+    "Candidatas iniciales",
+    "Sin variables tipo ID",
+    "Con <= 30% NA",
+    "Sin varianza casi nula",
+    "Predictoras finales (numéricas)"
+  ),
+  n_variables = c(
+    length(vars_candidatas),
+    length(vars_sin_id),
+    length(vars_bajo_na),
+    length(vars_no_nzv),
+    length(vars_predictoras)
+  )
+)
+
+kable(resumen_seleccion,
+      col.names = c("Etapa del filtrado", "N° variables"),
+      caption = "Resumen de selección de predictores") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### Entrenamiento del modelo logístico binario (`glm`)
+
+```{r entrenar-modelo-base}
+train_model <- train_data %>%
+  select(all_of(c("es_caro", vars_predictoras))) %>%
+  drop_na()
+
+cat("Filas utilizadas para entrenar glm (tras drop_na):", nrow(train_model), "\n")
+
+formula_base <- as.formula(
+  paste("es_caro ~", paste(vars_predictoras, collapse = " + "))
+)
+
+modelo_base <- glm(formula_base, data = train_model, family = binomial(link = "logit"))
+
+cat("Modelo base entrenado correctamente.\n")
+```
+
+### Validación cruzada 10-fold (AUC)
+
+```{r cv-10fold-auc}
+cv_data <- train_model %>%
+  mutate(
+    es_caro_factor = factor(ifelse(es_caro == 1, "caro", "no_caro"),
+                            levels = c("caro", "no_caro"))
+  ) %>%
+  select(-es_caro)
+
+formula_cv <- as.formula(
+  paste("es_caro_factor ~", paste(vars_predictoras, collapse = " + "))
+)
+
+ctrl_cv <- caret::trainControl(
+  method = "cv",
+  number = 10,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+set.seed(SEED_GLOBAL)
+modelo_cv <- caret::train(
+  formula_cv,
+  data = cv_data,
+  method = "glm",
+  family = binomial(),
+  trControl = ctrl_cv,
+  metric = "ROC"
+)
+
+auc_cv_promedio <- modelo_cv$results$ROC[1]
+cat("AUC promedio (CV 10-fold):", round(auc_cv_promedio, 4), "\n")
+```
+
+### Accuracy en train con umbral 0.5
+
+```{r accuracy-train-05}
+probs_train <- predict(modelo_base, newdata = train_model, type = "response")
+pred_train  <- ifelse(probs_train >= 0.5, 1L, 0L)
+acc_train_05 <- mean(pred_train == train_model$es_caro)
+
+cat("Accuracy en train (umbral 0.5):", round(acc_train_05, 4), "\n")
+```
+
+```{r resumen-act3}
+resumen_act3 <- tibble(
+  metrica = c("AUC promedio CV (10-fold)", "Accuracy train (umbral 0.5)"),
+  valor = c(auc_cv_promedio, acc_train_05)
+)
+
+kable(resumen_act3, digits = 4,
+      col.names = c("Métrica", "Valor"),
+      caption = "Resultados principales de la Actividad 3") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Actividad 4 — Análisis del Modelo
+
+### Significancia estadística de coeficientes
+
+```{r coef-significancia}
+tabla_coef <- broom::tidy(modelo_base) %>%
+  mutate(
+    significancia = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      p.value < 0.10  ~ ".",
+      TRUE            ~ "ns"
+    )
+  )
+
+kable(tabla_coef,
+      digits = 4,
+      col.names = c("Término", "Coef.", "Std. Error", "z-value", "p-value", "Sig."),
+      caption = "Coeficientes del modelo logístico y su significancia") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### Diagnóstico de multicolinealidad (VIF)
+
+```{r vif-modelo}
+vif_raw <- car::vif(modelo_base)
+
+tabla_vif <- tibble(
+  variable = names(vif_raw),
+  vif = as.numeric(vif_raw)
+) %>%
+  mutate(vif_problematico = ifelse(vif > 5, "Sí", "No")) %>%
+  arrange(desc(vif))
+
+kable(tabla_vif,
+      digits = 3,
+      col.names = c("Variable", "VIF", "¿VIF > 5?"),
+      caption = "Diagnóstico de multicolinealidad (VIF)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+vars_vif_alto <- tabla_vif %>% filter(vif > 5) %>% pull(variable)
+
+if (length(vars_vif_alto) == 0) {
+  cat("No se detectaron variables con VIF > 5. Se mantienen todos los predictores seleccionados.\n")
+} else {
+  cat("Variables con VIF > 5:", paste(vars_vif_alto, collapse = ", "), "\n")
+  cat("Decisión: se mantienen temporalmente para no alterar la línea base; ")
+  cat("su posible eliminación se evaluará en selección de modelo (AIC/BIC) de la Entrega 2.\n")
+}
+```
+
+### Odds ratios e interpretación en lenguaje de negocio
+
+```{r odds-ratios}
+tabla_or <- broom::tidy(modelo_base) %>%
+  mutate(
+    odds_ratio = exp(estimate),
+    ci_low = exp(estimate - 1.96 * std.error),
+    ci_high = exp(estimate + 1.96 * std.error)
+  ) %>%
+  select(term, odds_ratio, ci_low, ci_high, p.value) %>%
+  mutate(significativa = ifelse(p.value < 0.05, "Sí", "No"))
+
+kable(tabla_or,
+      digits = 4,
+      col.names = c("Término", "Odds Ratio", "IC 2.5%", "IC 97.5%", "p-value", "¿Sig. 5%?"),
+      caption = "Odds ratios del modelo base") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r interpretar-3-or, results='asis'}
+top_or <- tabla_or %>%
+  filter(term != "(Intercept)") %>%
+  arrange(p.value) %>%
+  slice_head(n = 3)
+
+cat("Interpretación de al menos 3 odds ratios (lenguaje de negocio):\n\n")
+
+for (i in seq_len(nrow(top_or))) {
+  termino <- top_or$term[i]
+  or_i <- top_or$odds_ratio[i]
+
+  if (or_i >= 1) {
+    pct <- (or_i - 1) * 100
+    cat("- **", termino, "**: manteniendo las demás variables constantes, ",
+        "un aumento de 1 unidad en esta variable incrementa los odds de que la propiedad sea *cara* en aproximadamente ",
+        round(pct, 2), "% (OR = ", round(or_i, 3), ").\n", sep = "")
+  } else {
+    pct <- (1 - or_i) * 100
+    cat("- **", termino, "**: manteniendo las demás variables constantes, ",
+        "un aumento de 1 unidad en esta variable reduce los odds de que la propiedad sea *cara* en aproximadamente ",
+        round(pct, 2), "% (OR = ", round(or_i, 3), ").\n", sep = "")
+  }
+}
+```
+
+### Variables no significativas: decisión
+
+```{r vars-no-significativas}
+no_sig <- tabla_coef %>%
+  filter(term != "(Intercept)", p.value >= 0.05) %>%
+  arrange(desc(p.value))
+
+if (nrow(no_sig) == 0) {
+  cat("Todas las variables predictoras resultaron significativas al 5%.\n")
+} else {
+  kable(no_sig,
+        digits = 4,
+        col.names = c("Término", "Coef.", "Std. Error", "z-value", "p-value", "Sig."),
+        caption = "Variables no significativas (p >= 0.05)") %>%
+    kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+  cat("\nDecisión: se mantienen en el modelo base para preservar una referencia completa. ")
+}
+```
+
+### Exportación del modelo base para P3
+
+```{r exportar-modelo-base}
+save(modelo_base, vars_predictoras, formula_base, auc_cv_promedio, acc_train_05,
+     file = "modelo_base.RData")
+
+cat("modelo_base.RData exportado correctamente.\n")
+cat("Contiene: modelo_base, vars_predictoras, formula_base, auc_cv_promedio, acc_train_05\n")
+```
+
+---
+
