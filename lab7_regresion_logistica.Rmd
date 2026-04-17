@@ -1,0 +1,260 @@
+---
+title: "Lab 7 – Regresión Logística"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Configuración
+
+```{r librerias}
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(gridExtra)
+```
+
+```{r seed-global}
+# Seed global compartido con todo el equipo — NO cambiar
+SEED_GLOBAL <- 42
+set.seed(SEED_GLOBAL)
+```
+
+---
+
+# Actividad 1 — Variables Dicotómicas y Multiclase
+
+## Carga del dataset
+
+```{r carga}
+load("listings.RData")
+cat("Dataset cargado:", nrow(listings), "filas,", ncol(listings), "columnas\n")
+```
+
+## Limpieza de la variable `price`
+
+`price` viene como texto con formato `"$97.00"`. Se elimina el símbolo `$` y las comas, y se convierte a numérico.
+
+```{r limpiar-price}
+# Distribución antes de limpiar
+cat("Clase original de price:", class(listings$price), "\n")
+cat("Ejemplos originales:", head(listings$price, 5), "\n")
+
+# Limpieza
+listings <- listings %>%
+  mutate(
+    price_num = as.numeric(gsub("[$,]", "", price))
+  )
+
+# Verificar NAs generados
+nas_price <- sum(is.na(listings$price_num))
+cat("\nNAs en price_num tras conversión:", nas_price,
+    sprintf("(%.2f%%)", 100 * nas_price / nrow(listings)), "\n")
+```
+
+```{r eliminar-nas-price}
+# Eliminar filas sin precio válido
+listings_clean <- listings %>% filter(!is.na(price_num), price_num > 0)
+
+cat("Filas tras eliminar NAs y precios en 0:", nrow(listings_clean), "\n")
+cat("Filas eliminadas:", nrow(listings) - nrow(listings_clean), "\n")
+```
+
+```{r dist-precio, fig.width=8, fig.height=4}
+# Distribución del precio limpio (log-scale para mejor visualización)
+ggplot(listings_clean, aes(x = price_num)) +
+  geom_histogram(bins = 80, fill = "#2196F3", color = "white", alpha = 0.8) +
+  scale_x_log10(labels = scales::dollar) +
+  labs(
+    title = "Distribución del precio por noche (escala logarítmica)",
+    x = "Precio (USD, log)",
+    y = "Frecuencia"
+  ) +
+  theme_minimal()
+```
+
+## Cálculo de percentiles y creación de variables
+
+Se usan percentiles 33 y 66 del precio como umbrales en lugar de valores fijos de negocio, porque:
+
+1. **Garantizan clases balanceadas** en la variable objetivo, lo que es esencial para entrenar un modelo logístico sin sesgo hacia la clase mayoritaria.
+2. **Son robustos al skew** del precio, que es fuertemente asimétrico a la derecha (hay propiedades muy caras que distorsionarían umbrales fijos).
+3. **Son reproducibles**: dado el mismo dataset, producen exactamente los mismos cortes.
+
+```{r percentiles}
+p33 <- quantile(listings_clean$price_num, 0.33)
+p66 <- quantile(listings_clean$price_num, 0.66)
+
+cat("Percentil 33 (umbral bajo/medio):", scales::dollar(p33), "\n")
+cat("Percentil 66 (umbral medio/caro):", scales::dollar(p66), "\n")
+```
+
+```{r crear-variables}
+listings_clean <- listings_clean %>%
+  mutate(
+    # Variable binaria: 1 = caro (precio > p66), 0 = no caro
+    es_caro = ifelse(price_num > p66, 1L, 0L),
+
+    # Variable multiclase: 3 niveles por percentiles 33 y 66
+    categoria_precio = case_when(
+      price_num <= p33 ~ "economico",
+      price_num <= p66 ~ "medio",
+      TRUE             ~ "caro"
+    ),
+    categoria_precio = factor(categoria_precio,
+                              levels = c("economico", "medio", "caro"))
+  )
+```
+
+## Verificación de balance de clases
+
+```{r balance-binaria}
+balance_bin <- listings_clean %>%
+  count(es_caro) %>%
+  mutate(
+    etiqueta  = ifelse(es_caro == 1, "Caro", "No caro"),
+    proporcion = n / sum(n)
+  )
+
+kable(balance_bin %>% select(etiqueta, n, proporcion),
+      col.names = c("Clase", "N", "Proporción"),
+      digits = 4,
+      caption = "Balance de la variable binaria `es_caro`") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r balance-multiclase}
+balance_multi <- listings_clean %>%
+  count(categoria_precio) %>%
+  mutate(proporcion = n / sum(n))
+
+kable(balance_multi,
+      col.names = c("Categoría", "N", "Proporción"),
+      digits = 4,
+      caption = "Balance de la variable multiclase `categoria_precio`") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r grafico-clases, fig.width=8, fig.height=4}
+p1 <- ggplot(listings_clean, aes(x = factor(es_caro), fill = factor(es_caro))) +
+  geom_bar(show.legend = FALSE) +
+  scale_fill_manual(values = c("#4CAF50", "#F44336")) +
+  scale_x_discrete(labels = c("No caro", "Caro")) +
+  labs(title = "Variable binaria: es_caro", x = "", y = "Frecuencia") +
+  theme_minimal()
+
+p2 <- ggplot(listings_clean, aes(x = categoria_precio, fill = categoria_precio)) +
+  geom_bar(show.legend = FALSE) +
+  scale_fill_manual(values = c("#4CAF50", "#FF9800", "#F44336")) +
+  labs(title = "Variable multiclase: categoria_precio", x = "", y = "Frecuencia") +
+  theme_minimal()
+
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+
+---
+
+# Actividad 2 — Train/Test Split
+
+## Justificación de la proporción 75/25
+
+Se usa una división **75% train / 25% test** porque:
+
+- Con ~170K filas, el conjunto de prueba (~42K) es suficientemente grande para obtener estimaciones robustas de las métricas sin desperdiciar datos de entrenamiento.
+- La proporción 80/20 también es válida, pero 75/25 da un poco más de poder estadístico en la evaluación del test.
+- Se usa **división estratificada** (`createDataPartition`) para que la proporción de clases sea la misma en train y test, evitando distribuciones desiguales por azar.
+
+## Split estratificado
+
+Se implementa el muestreo estratificado manualmente: se toma el 75% de cada clase por separado y luego se unen, garantizando que la proporción de `es_caro` sea idéntica en train y test.
+
+```{r split}
+set.seed(SEED_GLOBAL)
+
+# Muestrear 75% dentro de cada clase para garantizar balance
+idx_train <- listings_clean %>%
+  mutate(.row = row_number()) %>%
+  group_by(es_caro) %>%
+  slice_sample(prop = 0.75) %>%
+  pull(.row)
+
+train_data <- listings_clean[ idx_train, ]
+test_data  <- listings_clean[-idx_train, ]
+
+cat("Train:", nrow(train_data), "filas,", ncol(train_data), "columnas\n")
+cat("Test: ", nrow(test_data),  "filas,", ncol(test_data),  "columnas\n")
+cat("Proporción train:", round(nrow(train_data) / nrow(listings_clean), 3), "\n")
+```
+
+## Verificación del balance en ambos conjuntos
+
+```{r verificar-balance}
+balance_split <- bind_rows(
+  train_data %>% count(es_caro) %>% mutate(conjunto = "Train"),
+  test_data  %>% count(es_caro) %>% mutate(conjunto = "Test")
+) %>%
+  group_by(conjunto) %>%
+  mutate(proporcion = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(clase = ifelse(es_caro == 1, "Caro", "No caro")) %>%
+  select(conjunto, clase, n, proporcion)
+
+kable(balance_split,
+      col.names = c("Conjunto", "Clase", "N", "Proporción"),
+      digits = 4,
+      caption = "Balance de clases en Train y Test") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  collapse_rows(columns = 1, valign = "middle")
+```
+
+```{r verificar-balance-multiclase}
+balance_split_multi <- bind_rows(
+  train_data %>% count(categoria_precio) %>% mutate(conjunto = "Train"),
+  test_data  %>% count(categoria_precio) %>% mutate(conjunto = "Test")
+) %>%
+  group_by(conjunto) %>%
+  mutate(proporcion = n / sum(n)) %>%
+  ungroup() %>%
+  select(conjunto, categoria_precio, n, proporcion)
+
+kable(balance_split_multi,
+      col.names = c("Conjunto", "Categoría", "N", "Proporción"),
+      digits = 4,
+      caption = "Balance de categoría_precio en Train y Test") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  collapse_rows(columns = 1, valign = "middle")
+```
+
+## Exportación del split
+
+```{r exportar-splits}
+save(train_data, test_data, SEED_GLOBAL, p33, p66, file = "splits.RData")
+cat("splits.RData exportado correctamente.\n")
+cat("Contiene: train_data, test_data, SEED_GLOBAL (=", SEED_GLOBAL, "), p33, p66\n")
+```
+
+---
+
+# Resumen de Entregables P1
+
+| Entregable | Estado |
+|---|---|
+| `price` limpio y convertido a numérico | ✓ |
+| `es_caro` creado con umbrales justificados (p66) | ✓ |
+| `categoria_precio` creado con 3 niveles (p33/p66) | ✓ |
+| Balance de clases verificado en dataset completo | ✓ |
+| `splits.RData` exportado con train/test estratificado 75/25 | ✓ |
+| Balance de clases verificado en train y test | ✓ |
+
+**Seed global:** `r SEED_GLOBAL` — todos los integrantes deben usar `set.seed(42)`.
+
+**Percentil 33:** `r scales::dollar(p33)` | **Percentil 66:** `r scales::dollar(p66)`
