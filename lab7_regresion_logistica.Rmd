@@ -1,7 +1,13 @@
 ---
 title: "Lab 7 – Regresión Logística"
 date: "`r Sys.Date()`"
+header-includes:
+  - \usepackage{longtable}
+  - \usepackage{booktabs}
 output:
+  pdf_document:
+    toc: true
+    latex_engine: xelatex
   html_document:
     toc: true
     toc_float: true
@@ -11,7 +17,8 @@ output:
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+options(kableExtra.latex.load_packages = FALSE)
 ```
 
 # Configuración
@@ -132,7 +139,7 @@ balance_bin <- listings_clean %>%
 kable(balance_bin %>% select(etiqueta, n, proporcion),
       col.names = c("Clase", "N", "Proporción"),
       digits = 4,
-      caption = "Balance de la variable binaria `es_caro`") %>%
+      caption = "Balance de la variable binaria es_caro") %>%
   kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
 ```
 
@@ -144,7 +151,7 @@ balance_multi <- listings_clean %>%
 kable(balance_multi,
       col.names = c("Categoría", "N", "Proporción"),
       digits = 4,
-      caption = "Balance de la variable multiclase `categoria_precio`") %>%
+      caption = "Balance de la variable multiclase categoria_precio") %>%
   kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
 ```
 
@@ -216,8 +223,7 @@ kable(balance_split,
       col.names = c("Conjunto", "Clase", "N", "Proporción"),
       digits = 4,
       caption = "Balance de clases en Train y Test") %>%
-  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
-  collapse_rows(columns = 1, valign = "middle")
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
 ```
 
 ```{r verificar-balance-multiclase}
@@ -234,13 +240,12 @@ kable(balance_split_multi,
       col.names = c("Conjunto", "Categoría", "N", "Proporción"),
       digits = 4,
       caption = "Balance de categoría_precio en Train y Test") %>%
-  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
-  collapse_rows(columns = 1, valign = "middle")
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
 ```
 
 ## Exportación del split
 
-```{r exportar-splits}
+```{r exportar-splits, eval=FALSE}
 save(train_data, test_data, SEED_GLOBAL, p33, p66, file = "splits.RData")
 cat("splits.RData exportado correctamente.\n")
 cat("Contiene: train_data, test_data, SEED_GLOBAL (=", SEED_GLOBAL, "), p33, p66\n")
@@ -535,12 +540,240 @@ if (nrow(no_sig) == 0) {
 
 ### Exportación del modelo base para P3
 
-```{r exportar-modelo-base}
+```{r exportar-modelo-base, eval=FALSE}
 save(modelo_base, vars_predictoras, formula_base, auc_cv_promedio, acc_train_05,
      file = "modelo_base.RData")
 
 cat("modelo_base.RData exportado correctamente.\n")
 cat("Contiene: modelo_base, vars_predictoras, formula_base, auc_cv_promedio, acc_train_05\n")
+```
+
+---
+
+# P3 — Actividades 5 y 6
+
+## Actividad 5 — Evaluación en Test
+
+### Carga de prerequisitos
+
+```{r cargar-prereqs-p3}
+# train_data, test_data, modelo_base y vars_predictoras ya estan en el entorno
+# de knitr generados por los chunks de P1 y P2 en este mismo documento.
+cat("train:", nrow(train_data), "filas / test:", nrow(test_data), "filas\n")
+cat("Predictores:", length(vars_predictoras), "\n")
+cat("AUC CV (referencia de P2):", round(auc_cv_promedio, 4), "\n")
+```
+
+### Predicciones en test con umbral 0.5
+
+```{r predicciones-test}
+# Preparar test sin NAs en los predictores usados por el modelo
+test_model <- test_data %>%
+  select(all_of(c("es_caro", vars_predictoras))) %>%
+  drop_na()
+
+cat("Filas de test usadas (tras drop_na):", nrow(test_model), "\n")
+
+# Probabilidades predichas y clases con umbral 0.5
+probs_test <- predict(modelo_base, newdata = test_model, type = "response")
+pred_test  <- ifelse(probs_test >= 0.5, 1L, 0L)
+```
+
+### Métricas en test
+
+```{r metricas-test}
+tp <- sum(pred_test == 1L & test_model$es_caro == 1L)
+tn <- sum(pred_test == 0L & test_model$es_caro == 0L)
+fp <- sum(pred_test == 1L & test_model$es_caro == 0L)
+fn <- sum(pred_test == 0L & test_model$es_caro == 1L)
+
+accuracy  <- (tp + tn) / nrow(test_model)
+precision <- tp / (tp + fp)
+recall    <- tp / (tp + fn)
+f1        <- 2 * precision * recall / (precision + recall)
+
+roc_obj <- pROC::roc(test_model$es_caro, probs_test, quiet = TRUE)
+auc_test <- as.numeric(pROC::auc(roc_obj))
+
+tabla_metricas_test <- tibble(
+  Métrica = c("Accuracy", "Precision", "Recall (Sensitivity)", "F1-Score", "AUC-ROC"),
+  Valor   = c(accuracy, precision, recall, f1, auc_test)
+)
+
+kable(tabla_metricas_test,
+      digits = 4,
+      col.names = c("Métrica", "Valor"),
+      caption = "Métricas del modelo base en el conjunto de test (umbral = 0.5)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### Curva ROC
+
+```{r curva-roc, fig.width=7, fig.height=5}
+roc_df <- data.frame(
+  fpr = 1 - roc_obj$specificities,
+  tpr = roc_obj$sensitivities
+)
+
+ggplot(roc_df, aes(x = fpr, y = tpr)) +
+  geom_line(color = "#2196F3", linewidth = 1.2) +
+  geom_abline(linetype = "dashed", color = "grey60") +
+  annotate("text", x = 0.65, y = 0.15,
+           label = paste0("AUC = ", round(auc_test, 4)),
+           size = 5, color = "#1565C0", fontface = "bold") +
+  labs(
+    title = "Curva ROC - Modelo Logistico Base (conjunto de test)",
+    x = "Tasa de Falsos Positivos (1 - Specificity)",
+    y = "Tasa de Verdaderos Positivos (Sensitivity)"
+  ) +
+  theme_minimal()
+```
+
+La curva ROC se aleja claramente de la diagonal (clasificador aleatorio), lo que indica que el modelo tiene capacidad discriminativa real. Un AUC cercano a 1 refleja que el modelo logra separar bien propiedades caras de las no caras.
+
+### Comparación AUC en CV vs AUC en test
+
+```{r comparar-auc}
+tabla_auc_comp <- tibble(
+  Evaluación = c("CV 10-fold (train, P2)", "Test set (P3)"),
+  AUC        = c(auc_cv_promedio, auc_test),
+  Diferencia = c(NA_real_, auc_cv_promedio - auc_test)
+)
+
+kable(tabla_auc_comp,
+      digits = 4,
+      col.names = c("Evaluación", "AUC", "Δ AUC (CV − Test)"),
+      caption = "Comparación AUC: validación cruzada vs conjunto de test") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r interpretacion-auc, results='asis'}
+delta <- auc_cv_promedio - auc_test
+
+if (abs(delta) <= 0.02) {
+  cat("> **Interpretación:** La diferencia entre el AUC de CV y el AUC en test es de",
+      round(abs(delta), 4), ", lo que está dentro del margen de variabilidad esperado.",
+      "No hay señales de overfitting: el modelo generaliza bien.\n")
+} else if (delta > 0.02) {
+  cat("> **Interpretación:** El AUC en CV supera al AUC en test por",
+      round(delta, 4), "puntos. Esta brecha sugiere cierto grado de overfitting:",
+      "el modelo se ajusta mejor a los datos de entrenamiento que a datos nuevos.\n")
+} else {
+  cat("> **Interpretación:** El AUC en test supera al de CV por",
+      round(abs(delta), 4), "puntos. El modelo generaliza correctamente.\n")
+}
+```
+
+---
+
+## Actividad 6 — Overfitting y Curvas de Aprendizaje
+
+Las curvas de aprendizaje miden cómo evoluciona el desempeño del modelo a medida que aumenta la cantidad de datos de entrenamiento disponibles. Se entrena el mismo modelo logístico con subconjuntos crecientes del `train_data` (del 10% al 100% en pasos del 10%) y se evalúa el accuracy tanto sobre ese subconjunto como sobre el `test_data` completo.
+
+```{r curvas-aprendizaje, cache=TRUE}
+# Preparar datos sin NAs para el loop
+train_curvas <- train_data %>%
+  select(all_of(c("es_caro", vars_predictoras))) %>%
+  drop_na()
+
+proporciones <- seq(0.10, 1.00, by = 0.10)
+
+resultados_curvas <- purrr::map_dfr(proporciones, function(prop) {
+  set.seed(SEED_GLOBAL)
+
+  n_filas <- floor(nrow(train_curvas) * prop)
+  idx     <- sample(seq_len(nrow(train_curvas)), size = n_filas)
+  subset  <- train_curvas[idx, ]
+
+  modelo_subset <- glm(formula_base, data = subset, family = binomial(link = "logit"))
+
+  # Accuracy en el subconjunto de entrenamiento
+  probs_sub <- predict(modelo_subset, newdata = subset, type = "response")
+  acc_train_sub <- mean(ifelse(probs_sub >= 0.5, 1L, 0L) == subset$es_caro)
+
+  # Accuracy en test completo
+  probs_test_sub <- predict(modelo_subset, newdata = test_model, type = "response")
+  acc_test_sub   <- mean(ifelse(probs_test_sub >= 0.5, 1L, 0L) == test_model$es_caro)
+
+  tibble(
+    proporcion  = prop,
+    n_filas     = n_filas,
+    acc_train   = acc_train_sub,
+    acc_test    = acc_test_sub
+  )
+})
+```
+
+```{r grafico-curvas-aprendizaje, fig.width=8, fig.height=5}
+curvas_long <- resultados_curvas %>%
+  pivot_longer(cols = c(acc_train, acc_test),
+               names_to  = "conjunto",
+               values_to = "accuracy") %>%
+  mutate(conjunto = ifelse(conjunto == "acc_train", "Train", "Test"))
+
+ggplot(curvas_long, aes(x = proporcion * 100, y = accuracy, color = conjunto)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c("Train" = "#F44336", "Test" = "#2196F3")) +
+  scale_x_continuous(breaks = seq(10, 100, by = 10), labels = function(x) paste0(x, "%")) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  labs(
+    title  = "Curvas de Aprendizaje - Modelo Logistico Base",
+    x      = "Porcentaje de datos de entrenamiento usados",
+    y      = "Accuracy",
+    color  = "Conjunto"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+
+```{r diagnostico-curvas, results='asis'}
+# Diagnóstico automático basado en el gap al 100% de datos
+gap_final       <- resultados_curvas$acc_train[10] - resultados_curvas$acc_test[10]
+acc_test_final  <- resultados_curvas$acc_test[10]
+acc_train_final <- resultados_curvas$acc_train[10]
+
+cat("**Accuracy en train al 100% de datos:**", round(acc_train_final, 4), "\n\n")
+cat("**Accuracy en test al 100% de datos:**", round(acc_test_final, 4), "\n\n")
+cat("**Gap train − test:**", round(gap_final, 4), "\n\n")
+
+if (gap_final > 0.05) {
+  cat("> **Diagnóstico: Overfitting.** El modelo rinde significativamente mejor en train que en test.",
+      "La brecha de", round(gap_final, 4), "sugiere que el modelo memoriza el conjunto de entrenamiento",
+      "en lugar de aprender patrones generalizables.",
+      "**Recomendación:** aplicar regularización (Lasso/Ridge) para penalizar la complejidad del modelo.\n")
+} else if (acc_test_final < 0.65 && gap_final <= 0.05) {
+  cat("> **Diagnóstico: Underfitting.** Ambas curvas convergen en valores de accuracy bajos.",
+      "El modelo no captura suficiente información del problema.",
+      "**Recomendación:** agregar variables más informativas o considerar modelos más flexibles.\n")
+} else {
+  cat("> **Diagnóstico: Comportamiento saludable.** Las curvas train y test se acercan progresivamente",
+      "a medida que aumentan los datos de entrenamiento, y la brecha final es pequeña (",
+      round(gap_final, 4), "). El modelo generaliza correctamente.",
+      "**Recomendación:** el modelo base es adecuado; se puede explorar regularización",
+      "leve para verificar si mejora la estabilidad.\n")
+}
+```
+
+### Tabla de resultados por proporción
+
+```{r tabla-curvas}
+kable(resultados_curvas %>%
+        mutate(proporcion = paste0(proporcion * 100, "%")) %>%
+        select(proporcion, n_filas, acc_train, acc_test),
+      digits = 4,
+      col.names = c("% datos train", "N filas", "Accuracy Train", "Accuracy Test"),
+      caption = "Evolución del accuracy por tamaño del subconjunto de entrenamiento") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### Exportación de objetos para Entrega 2
+
+```{r exportar-p3, eval=FALSE}
+save(probs_test, roc_obj, file = "eval_test.RData")
+
+cat("eval_test.RData exportado correctamente.\n")
+cat("Contiene: probs_test (probabilidades predichas en test), roc_obj (objeto ROC para Youden)\n")
 ```
 
 ---

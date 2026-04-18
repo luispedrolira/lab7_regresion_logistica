@@ -3,3 +3,17 @@
 .RData
 .Ruserdata
 listings.RData
+lab7_regresion_logistica.html
+lab7_regresion_logistica.log
+lab7_regresion_logistica.text
+plan_lab7_regresion_logistica.md
+modelo_base.RData
+splits.RData
+
+
+
+# Archivos temporales de knit
+*.tex
+*.log
+*_files/
+*_cache/
