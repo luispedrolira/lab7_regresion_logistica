@@ -1,0 +1,1069 @@
+---
+
+# Actividades 7 y 8
+
+## Actividad 7 — Tuneo con Regularizacion
+
+### Preparacion de prerequisitos
+
+```{r preparar-actividad7}
+if (!exists("train_data") || !exists("test_data")) {
+  load("splits.RData")
+}
+
+if (!exists("modelo_base") || !exists("vars_predictoras")) {
+  load("modelo_base.RData")
+}
+
+if (!exists("SEED_GLOBAL")) {
+  SEED_GLOBAL <- 42
+}
+
+train_reg <- train_data %>%
+  select(all_of(c("es_caro", vars_predictoras))) %>%
+  drop_na()
+
+test_reg <- test_data %>%
+  select(all_of(c("es_caro", vars_predictoras))) %>%
+  drop_na()
+
+x_train <- model.matrix(~ . - 1, data = train_reg %>% select(all_of(vars_predictoras)))
+y_train <- train_reg$es_caro
+
+x_test <- model.matrix(~ . - 1, data = test_reg %>% select(all_of(vars_predictoras)))
+y_test <- test_reg$es_caro
+
+cat("Filas train usadas en regularizacion:", nrow(train_reg), "\n")
+cat("Filas test usadas en regularizacion:", nrow(test_reg), "\n")
+cat("Numero de predictores:", ncol(x_train), "\n")
+```
+
+Se utiliza `cv.glmnet` con validacion cruzada interna de 10 folds y `type.measure = "auc"`.  
+El lambda optimo de cada variante se toma como `lambda.min` (maximiza el AUC promedio de CV).
+
+### Entrenamiento de Lasso, Ridge y Elastic Net
+
+```{r tuneo-regularizacion}
+entrenar_cv_glmnet <- function(alpha_val, nombre_modelo) {
+  set.seed(SEED_GLOBAL)
+  cv_fit <- cv.glmnet(
+    x = x_train,
+    y = y_train,
+    family = "binomial",
+    alpha = alpha_val,
+    nfolds = 10,
+    type.measure = "auc",
+    standardize = TRUE
+  )
+
+  idx_lambda_min <- which.min(abs(cv_fit$lambda - cv_fit$lambda.min))
+  auc_cv <- cv_fit$cvm[idx_lambda_min]
+
+  probs_test_modelo <- as.vector(
+    predict(cv_fit, newx = x_test, s = "lambda.min", type = "response")
+  )
+
+  auc_test_modelo <- as.numeric(pROC::auc(y_test, probs_test_modelo))
+
+  list(
+    nombre = nombre_modelo,
+    alpha = alpha_val,
+    lambda_opt = cv_fit$lambda.min,
+    auc_cv = auc_cv,
+    probs_test = probs_test_modelo,
+    auc_test = auc_test_modelo,
+    cv_fit = cv_fit
+  )
+}
+
+res_lasso <- entrenar_cv_glmnet(alpha_val = 1, nombre_modelo = "Lasso")
+res_ridge <- entrenar_cv_glmnet(alpha_val = 0, nombre_modelo = "Ridge")
+res_elastic <- entrenar_cv_glmnet(alpha_val = 0.5, nombre_modelo = "Elastic Net")
+
+probs_base_act7 <- predict(modelo_base, newdata = test_reg, type = "response")
+auc_base_act7 <- as.numeric(pROC::auc(y_test, probs_base_act7))
+
+resultados_regularizacion <- bind_rows(
+  tibble(
+    Modelo = "Lasso",
+    alpha = res_lasso$alpha,
+    lambda_optimo = res_lasso$lambda_opt,
+    auc_cv = res_lasso$auc_cv,
+    auc_test = res_lasso$auc_test
+  ),
+  tibble(
+    Modelo = "Ridge",
+    alpha = res_ridge$alpha,
+    lambda_optimo = res_ridge$lambda_opt,
+    auc_cv = res_ridge$auc_cv,
+    auc_test = res_ridge$auc_test
+  ),
+  tibble(
+    Modelo = "Elastic Net",
+    alpha = res_elastic$alpha,
+    lambda_optimo = res_elastic$lambda_opt,
+    auc_cv = res_elastic$auc_cv,
+    auc_test = res_elastic$auc_test
+  )
+)
+
+tabla_auc_comp_reg <- bind_rows(
+  tibble(
+    Modelo = "Base (sin regularizacion)",
+    alpha = NA_real_,
+    lambda_optimo = NA_real_,
+    auc_cv = NA_real_,
+    auc_test = auc_base_act7
+  ),
+  resultados_regularizacion
+)
+```
+
+```{r tabla-auc-regularizacion}
+kable(tabla_auc_comp_reg,
+      digits = 4,
+      col.names = c("Modelo", "Alpha", "Lambda optimo", "AUC CV interno", "AUC test"),
+      caption = "Comparacion de AUC: modelo base vs modelos regularizados") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r mejor-modelo-regularizado}
+mejor_modelo_reg <- resultados_regularizacion %>%
+  slice_max(order_by = auc_test, n = 1, with_ties = FALSE)
+
+nombre_mejor_reg <- mejor_modelo_reg$Modelo[1]
+
+probs_regularizados <- setNames(
+  object = list(res_lasso$probs_test, res_ridge$probs_test, res_elastic$probs_test),
+  nm = c("Lasso", "Ridge", "Elastic Net")
+)
+
+probs_mejor_reg <- probs_regularizados[[nombre_mejor_reg]]
+
+cat("Mejor variante regularizada en test:", nombre_mejor_reg, "\n")
+cat("AUC test del mejor modelo regularizado:", round(mejor_modelo_reg$auc_test[1], 4), "\n")
+cat("AUC test del modelo base:", round(auc_base_act7, 4), "\n")
+
+if (mejor_modelo_reg$auc_test[1] > auc_base_act7) {
+  cat("Conclusion: la regularizacion mejora el modelo base en AUC de test.\n")
+} else if (abs(mejor_modelo_reg$auc_test[1] - auc_base_act7) <= 0.002) {
+  cat("Conclusion: la regularizacion mantiene un desempeno similar al modelo base.\n")
+} else {
+  cat("Conclusion: la regularizacion no supera al modelo base en AUC de test.\n")
+}
+```
+
+### Variables eliminadas por Lasso
+
+```{r variables-eliminadas-lasso}
+coef_lasso <- as.matrix(coef(res_lasso$cv_fit, s = "lambda.min"))
+
+tabla_coef_lasso <- tibble(
+  variable = rownames(coef_lasso),
+  coeficiente = as.numeric(coef_lasso[, 1])
+) %>%
+  filter(variable != "(Intercept)") %>%
+  mutate(
+    eliminada = ifelse(abs(coeficiente) < 1e-10, "Si", "No")
+  )
+
+vars_eliminadas_lasso <- tabla_coef_lasso %>%
+  filter(eliminada == "Si") %>%
+  pull(variable)
+
+if (length(vars_eliminadas_lasso) == 0) {
+  cat("Lasso no elimino variables con lambda.min.\n")
+} else {
+  tabla_vars_eliminadas <- tibble(variable_eliminada = vars_eliminadas_lasso)
+
+  kable(tabla_vars_eliminadas,
+        caption = "Variables con coeficiente 0 en Lasso (lambda optimo)") %>%
+    kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+}
+```
+
+Las variables que Lasso lleva a cero suelen ser predictores redundantes o de bajo aporte marginal una vez controladas las demas variables.  
+Si la eliminacion afecta variables con poca significancia estadistica o con alta correlacion con otras, la reduccion de complejidad es razonable desde el punto de vista de negocio y generalizacion.
+
+---
+
+## Actividad 8 — Matriz de Confusion y Metricas Completas
+
+```{r funciones-metricas}
+calcular_desempeno_binario <- function(y_real, probs, umbral = 0.5) {
+  pred <- ifelse(probs >= umbral, 1L, 0L)
+
+  tp <- sum(pred == 1L & y_real == 1L)
+  tn <- sum(pred == 0L & y_real == 0L)
+  fp <- sum(pred == 1L & y_real == 0L)
+  fn <- sum(pred == 0L & y_real == 1L)
+
+  accuracy <- (tp + tn) / length(y_real)
+  sensitivity <- ifelse((tp + fn) == 0, NA_real_, tp / (tp + fn))
+  specificity <- ifelse((tn + fp) == 0, NA_real_, tn / (tn + fp))
+  precision <- ifelse((tp + fp) == 0, NA_real_, tp / (tp + fp))
+  f1 <- ifelse(
+    is.na(precision) || is.na(sensitivity) || (precision + sensitivity) == 0,
+    NA_real_,
+    2 * precision * sensitivity / (precision + sensitivity)
+  )
+  auc <- as.numeric(pROC::auc(y_real, probs))
+
+  matriz <- tibble(
+    Real = c("Caro (1)", "No caro (0)"),
+    `Predicho caro (1)` = c(tp, fp),
+    `Predicho no caro (0)` = c(fn, tn)
+  )
+
+  metricas <- tibble(
+    Accuracy = accuracy,
+    Sensitivity = sensitivity,
+    Specificity = specificity,
+    Precision = precision,
+    F1 = f1,
+    AUC = auc
+  )
+
+  conteos <- tibble(TP = tp, TN = tn, FP = fp, FN = fn)
+
+  list(matriz = matriz, metricas = metricas, conteos = conteos)
+}
+```
+
+```{r evaluar-base-vs-mejor}
+eval_base <- calcular_desempeno_binario(y_test, probs_base_act7, umbral = 0.5)
+eval_regularizado <- calcular_desempeno_binario(y_test, probs_mejor_reg, umbral = 0.5)
+
+tabla_confusion_resumen <- bind_rows(
+  eval_base$conteos %>% mutate(Modelo = "Base"),
+  eval_regularizado$conteos %>% mutate(Modelo = paste0("Regularizado (", nombre_mejor_reg, ")"))
+) %>%
+  select(Modelo, TP, TN, FP, FN)
+
+tabla_metricas_act8 <- bind_rows(
+  eval_base$metricas %>% mutate(Modelo = "Base"),
+  eval_regularizado$metricas %>% mutate(Modelo = paste0("Regularizado (", nombre_mejor_reg, ")"))
+) %>%
+  select(Modelo, Accuracy, Sensitivity, Specificity, Precision, F1, AUC)
+```
+
+```{r matrices-confusion}
+kable(eval_base$matriz,
+      caption = "Matriz de confusion - Modelo base (umbral 0.5)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+kable(eval_regularizado$matriz,
+      caption = paste0("Matriz de confusion - Modelo regularizado ", nombre_mejor_reg, " (umbral 0.5)")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r tabla-confusion-resumen}
+kable(tabla_confusion_resumen,
+      caption = "Comparacion de TP, TN, FP y FN: base vs regularizado") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r tabla-metricas-act8}
+kable(tabla_metricas_act8,
+      digits = 4,
+      caption = "Metricas completas: base vs mejor modelo regularizado") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r analisis-errores, results='asis'}
+error_frecuente <- function(conteos_tbl) {
+  if (conteos_tbl$FP[1] > conteos_tbl$FN[1]) {
+    "FP (falsos positivos)"
+  } else if (conteos_tbl$FN[1] > conteos_tbl$FP[1]) {
+    "FN (falsos negativos)"
+  } else {
+    "FP y FN en la misma proporcion"
+  }
+}
+
+err_base <- error_frecuente(eval_base$conteos)
+err_reg <- error_frecuente(eval_regularizado$conteos)
+
+cat("**Error mas frecuente en modelo base:**", err_base, "\n\n")
+cat("**Error mas frecuente en modelo regularizado:**", err_reg, "\n\n")
+```
+
+En el contexto de SmartStay, suele ser mas costoso no detectar una propiedad realmente cara (FN), porque se pierde oportunidad de aplicar estrategias premium y capturar ingresos altos.  
+Por ello, al comparar modelos conviene priorizar **Sensitivity/Recall** sin descuidar Precision para evitar una sobreclasificacion excesiva de propiedades no caras como caras.
+
+title: "Lab 7 – Regresión Logística"
+date: "`r Sys.Date()`"
+header-includes:
+  - \usepackage{longtable}
+  - \usepackage{booktabs}
+output:
+  pdf_document:
+    toc: true
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+options(kableExtra.latex.load_packages = FALSE)
+```
+
+# Configuración
+
+```{r librerias}
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(gridExtra)
+library(caret)
+library(pROC)
+library(car)
+library(broom)
+library(glmnet)
+```
+
+```{r seed-global}
+# Seed global compartido con todo el equipo — NO cambiar
+SEED_GLOBAL <- 42
+set.seed(SEED_GLOBAL)
+```
+
+---
+
+# Actividad 1 — Variables Dicotómicas y Multiclase
+
+## Carga del dataset
+
+```{r carga}
+load("listings.RData")
+cat("Dataset cargado:", nrow(listings), "filas,", ncol(listings), "columnas\n")
+```
+
+## Limpieza de la variable `price`
+
+`price` viene como texto con formato `"$97.00"`. Se elimina el símbolo `$` y las comas, y se convierte a numérico.
+
+```{r limpiar-price}
+# Distribución antes de limpiar
+cat("Clase original de price:", class(listings$price), "\n")
+cat("Ejemplos originales:", head(listings$price, 5), "\n")
+
+# Limpieza
+listings <- listings %>%
+  mutate(
+    price_num = as.numeric(gsub("[$,]", "", price))
+  )
+
+# Verificar NAs generados
+nas_price <- sum(is.na(listings$price_num))
+cat("\nNAs en price_num tras conversión:", nas_price,
+    sprintf("(%.2f%%)", 100 * nas_price / nrow(listings)), "\n")
+```
+
+```{r eliminar-nas-price}
+# Eliminar filas sin precio válido
+listings_clean <- listings %>% filter(!is.na(price_num), price_num > 0)
+
+cat("Filas tras eliminar NAs y precios en 0:", nrow(listings_clean), "\n")
+cat("Filas eliminadas:", nrow(listings) - nrow(listings_clean), "\n")
+```
+
+```{r dist-precio, fig.width=8, fig.height=4}
+# Distribución del precio limpio (log-scale para mejor visualización)
+ggplot(listings_clean, aes(x = price_num)) +
+  geom_histogram(bins = 80, fill = "#2196F3", color = "white", alpha = 0.8) +
+  scale_x_log10(labels = scales::dollar) +
+  labs(
+    title = "Distribución del precio por noche (escala logarítmica)",
+    x = "Precio (USD, log)",
+    y = "Frecuencia"
+  ) +
+  theme_minimal()
+```
+
+## Cálculo de percentiles y creación de variables
+
+Se usan percentiles 33 y 66 del precio como umbrales en lugar de valores fijos de negocio, porque:
+
+1. **Garantizan clases balanceadas** en la variable objetivo, lo que es esencial para entrenar un modelo logístico sin sesgo hacia la clase mayoritaria.
+2. **Son robustos al skew** del precio, que es fuertemente asimétrico a la derecha (hay propiedades muy caras que distorsionarían umbrales fijos).
+3. **Son reproducibles**: dado el mismo dataset, producen exactamente los mismos cortes.
+
+```{r percentiles}
+p33 <- quantile(listings_clean$price_num, 0.33)
+p66 <- quantile(listings_clean$price_num, 0.66)
+
+cat("Percentil 33 (umbral bajo/medio):", scales::dollar(p33), "\n")
+cat("Percentil 66 (umbral medio/caro):", scales::dollar(p66), "\n")
+```
+
+```{r crear-variables}
+listings_clean <- listings_clean %>%
+  mutate(
+    # Variable binaria: 1 = caro (precio > p66), 0 = no caro
+    es_caro = ifelse(price_num > p66, 1L, 0L),
+
+    # Variable multiclase: 3 niveles por percentiles 33 y 66
+    categoria_precio = case_when(
+      price_num <= p33 ~ "economico",
+      price_num <= p66 ~ "medio",
+      TRUE             ~ "caro"
+    ),
+    categoria_precio = factor(categoria_precio,
+                              levels = c("economico", "medio", "caro"))
+  )
+```
+
+## Verificación de balance de clases
+
+```{r balance-binaria}
+balance_bin <- listings_clean %>%
+  count(es_caro) %>%
+  mutate(
+    etiqueta  = ifelse(es_caro == 1, "Caro", "No caro"),
+    proporcion = n / sum(n)
+  )
+
+kable(balance_bin %>% select(etiqueta, n, proporcion),
+      col.names = c("Clase", "N", "Proporción"),
+      digits = 4,
+      caption = "Balance de la variable binaria es_caro") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r balance-multiclase}
+balance_multi <- listings_clean %>%
+  count(categoria_precio) %>%
+  mutate(proporcion = n / sum(n))
+
+kable(balance_multi,
+      col.names = c("Categoría", "N", "Proporción"),
+      digits = 4,
+      caption = "Balance de la variable multiclase categoria_precio") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r grafico-clases, fig.width=8, fig.height=4}
+plot_binaria <- ggplot(listings_clean, aes(x = factor(es_caro), fill = factor(es_caro))) +
+  geom_bar(show.legend = FALSE) +
+  scale_fill_manual(values = c("#4CAF50", "#F44336")) +
+  scale_x_discrete(labels = c("No caro", "Caro")) +
+  labs(title = "Variable binaria: es_caro", x = "", y = "Frecuencia") +
+  theme_minimal()
+
+plot_multiclase <- ggplot(listings_clean, aes(x = categoria_precio, fill = categoria_precio)) +
+  geom_bar(show.legend = FALSE) +
+  scale_fill_manual(values = c("#4CAF50", "#FF9800", "#F44336")) +
+  labs(title = "Variable multiclase: categoria_precio", x = "", y = "Frecuencia") +
+  theme_minimal()
+
+gridExtra::grid.arrange(plot_binaria, plot_multiclase, ncol = 2)
+```
+
+---
+
+# Actividad 2 — Train/Test Split
+
+## Justificación de la proporción 75/25
+
+Se usa una división **75% train / 25% test** porque:
+
+- Con ~170K filas, el conjunto de prueba (~42K) es suficientemente grande para obtener estimaciones robustas de las métricas sin desperdiciar datos de entrenamiento.
+- La proporción 80/20 también es válida, pero 75/25 da un poco más de poder estadístico en la evaluación del test.
+- Se usa **división estratificada** (`createDataPartition`) para que la proporción de clases sea la misma en train y test, evitando distribuciones desiguales por azar.
+
+## Split estratificado
+
+Se implementa el muestreo estratificado manualmente: se toma el 75% de cada clase por separado y luego se unen, garantizando que la proporción de `es_caro` sea idéntica en train y test.
+
+```{r split}
+set.seed(SEED_GLOBAL)
+
+# Muestrear 75% dentro de cada clase para garantizar balance
+idx_train <- listings_clean %>%
+  mutate(.row = row_number()) %>%
+  group_by(es_caro) %>%
+  slice_sample(prop = 0.75) %>%
+  pull(.row)
+
+train_data <- listings_clean[ idx_train, ]
+test_data  <- listings_clean[-idx_train, ]
+
+cat("Train:", nrow(train_data), "filas,", ncol(train_data), "columnas\n")
+cat("Test: ", nrow(test_data),  "filas,", ncol(test_data),  "columnas\n")
+cat("Proporción train:", round(nrow(train_data) / nrow(listings_clean), 3), "\n")
+```
+
+## Verificación del balance en ambos conjuntos
+
+```{r verificar-balance}
+balance_split <- bind_rows(
+  train_data %>% count(es_caro) %>% mutate(conjunto = "Train"),
+  test_data  %>% count(es_caro) %>% mutate(conjunto = "Test")
+) %>%
+  group_by(conjunto) %>%
+  mutate(proporcion = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(clase = ifelse(es_caro == 1, "Caro", "No caro")) %>%
+  select(conjunto, clase, n, proporcion)
+
+kable(balance_split,
+      col.names = c("Conjunto", "Clase", "N", "Proporción"),
+      digits = 4,
+      caption = "Balance de clases en Train y Test") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r verificar-balance-multiclase}
+balance_split_multi <- bind_rows(
+  train_data %>% count(categoria_precio) %>% mutate(conjunto = "Train"),
+  test_data  %>% count(categoria_precio) %>% mutate(conjunto = "Test")
+) %>%
+  group_by(conjunto) %>%
+  mutate(proporcion = n / sum(n)) %>%
+  ungroup() %>%
+  select(conjunto, categoria_precio, n, proporcion)
+
+kable(balance_split_multi,
+      col.names = c("Conjunto", "Categoría", "N", "Proporción"),
+      digits = 4,
+      caption = "Balance de categoría_precio en Train y Test") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Exportación del split
+
+```{r exportar-splits, eval=FALSE}
+save(train_data, test_data, SEED_GLOBAL, p33, p66, file = "splits.RData")
+cat("splits.RData exportado correctamente.\n")
+cat("Contiene: train_data, test_data, SEED_GLOBAL (=", SEED_GLOBAL, "), p33, p66\n")
+```
+
+---
+
+
+
+**Seed global:** `r SEED_GLOBAL` — todos los integrantes deben usar `set.seed(42)`.
+
+**Percentil 33:** `r scales::dollar(p33)` | **Percentil 66:** `r scales::dollar(p66)`
+
+---
+
+# Actividades 3 y 4
+## Actividad 3 — Modelo Logístico Binario con Validación Cruzada
+
+### Carga de `splits.RData` 
+
+```{r cargar-splits-actividad3}
+load("splits.RData")
+
+cat("Splits cargados correctamente.\n")
+cat("Train:", nrow(train_data), "filas /", ncol(train_data), "columnas\n")
+cat("Test: ", nrow(test_data), "filas /", ncol(test_data), "columnas\n")
+cat("Seed global recibido:", SEED_GLOBAL, "\n")
+```
+
+### Selección de variables predictoras con criterio
+
+Se aplica el siguiente criterio para elegir predictores:
+
+1. Excluir variables objetivo y variables directamente derivadas de `price` para evitar fuga de información.
+2. Excluir posibles identificadores (`id`, `*_id`, etc.) porque no tienen valor predictivo generalizable.
+3. Excluir variables con más de 30% de valores faltantes.
+4. Excluir variables con varianza casi nula.
+5. Mantener variables numéricas para facilitar interpretación y diagnóstico de multicolinealidad con VIF.
+
+```{r seleccion-predictores}
+variables_excluir <- c("es_caro", "categoria_precio", "price", "price_num")
+
+vars_candidatas <- setdiff(names(train_data), variables_excluir)
+
+# 1) Excluir potenciales identificadores
+es_id <- grepl("(^id$|_id$|id$|^listing_id$|^host_id$|^scrape_id$)",
+               vars_candidatas,
+               ignore.case = TRUE)
+vars_sin_id <- vars_candidatas[!es_id]
+
+# 2) Excluir variables con demasiados NA (>30%)
+prop_na <- sapply(train_data[vars_sin_id], function(x) mean(is.na(x)))
+vars_bajo_na <- names(prop_na[prop_na <= 0.30])
+
+# 3) Excluir variables de varianza casi nula
+if (length(vars_bajo_na) > 0) {
+  nzv_info <- caret::nearZeroVar(train_data[vars_bajo_na], saveMetrics = TRUE)
+  vars_no_nzv <- rownames(nzv_info)[!nzv_info$nzv]
+} else {
+  vars_no_nzv <- character(0)
+}
+
+# 4) Mantener variables numéricas
+vars_predictoras <- vars_no_nzv[sapply(train_data[vars_no_nzv], is.numeric)]
+
+if (length(vars_predictoras) < 3) {
+  stop("Se seleccionaron menos de 3 predictores. Revisa el criterio de filtrado.")
+}
+
+cat("Número de predictores seleccionados:", length(vars_predictoras), "\n")
+cat("Predictores seleccionados:\n")
+print(vars_predictoras)
+```
+
+```{r tabla-criterio-vars}
+resumen_seleccion <- tibble(
+  etapa = c(
+    "Candidatas iniciales",
+    "Sin variables tipo ID",
+    "Con <= 30% NA",
+    "Sin varianza casi nula",
+    "Predictoras finales (numéricas)"
+  ),
+  n_variables = c(
+    length(vars_candidatas),
+    length(vars_sin_id),
+    length(vars_bajo_na),
+    length(vars_no_nzv),
+    length(vars_predictoras)
+  )
+)
+
+kable(resumen_seleccion,
+      col.names = c("Etapa del filtrado", "N° variables"),
+      caption = "Resumen de selección de predictores") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### Entrenamiento del modelo logístico binario (`glm`)
+
+```{r entrenar-modelo-base}
+train_model <- train_data %>%
+  select(all_of(c("es_caro", vars_predictoras))) %>%
+  drop_na()
+
+cat("Filas utilizadas para entrenar glm (tras drop_na):", nrow(train_model), "\n")
+
+formula_base <- as.formula(
+  paste("es_caro ~", paste(vars_predictoras, collapse = " + "))
+)
+
+modelo_base <- glm(formula_base, data = train_model, family = binomial(link = "logit"))
+
+cat("Modelo base entrenado correctamente.\n")
+```
+
+### Validación cruzada 10-fold (AUC)
+
+```{r cv-10fold-auc}
+cv_data <- train_model %>%
+  mutate(
+    es_caro_factor = factor(ifelse(es_caro == 1, "caro", "no_caro"),
+                            levels = c("caro", "no_caro"))
+  ) %>%
+  select(-es_caro)
+
+formula_cv <- as.formula(
+  paste("es_caro_factor ~", paste(vars_predictoras, collapse = " + "))
+)
+
+ctrl_cv <- caret::trainControl(
+  method = "cv",
+  number = 10,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+set.seed(SEED_GLOBAL)
+modelo_cv <- caret::train(
+  formula_cv,
+  data = cv_data,
+  method = "glm",
+  family = binomial(),
+  trControl = ctrl_cv,
+  metric = "ROC"
+)
+
+auc_cv_promedio <- modelo_cv$results$ROC[1]
+cat("AUC promedio (CV 10-fold):", round(auc_cv_promedio, 4), "\n")
+```
+
+### Accuracy en train con umbral 0.5
+
+```{r accuracy-train-05}
+probs_train <- predict(modelo_base, newdata = train_model, type = "response")
+pred_train  <- ifelse(probs_train >= 0.5, 1L, 0L)
+acc_train_05 <- mean(pred_train == train_model$es_caro)
+
+cat("Accuracy en train (umbral 0.5):", round(acc_train_05, 4), "\n")
+```
+
+```{r resumen-act3}
+resumen_act3 <- tibble(
+  metrica = c("AUC promedio CV (10-fold)", "Accuracy train (umbral 0.5)"),
+  valor = c(auc_cv_promedio, acc_train_05)
+)
+
+kable(resumen_act3, digits = 4,
+      col.names = c("Métrica", "Valor"),
+      caption = "Resultados principales de la Actividad 3") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Actividad 4 — Análisis del Modelo
+
+### Significancia estadística de coeficientes
+
+```{r coef-significancia}
+tabla_coef <- broom::tidy(modelo_base) %>%
+  mutate(
+    significancia = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      p.value < 0.10  ~ ".",
+      TRUE            ~ "ns"
+    )
+  )
+
+kable(tabla_coef,
+      digits = 4,
+      col.names = c("Término", "Coef.", "Std. Error", "z-value", "p-value", "Sig."),
+      caption = "Coeficientes del modelo logístico y su significancia") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### Diagnóstico de multicolinealidad (VIF)
+
+```{r vif-modelo}
+vif_raw <- car::vif(modelo_base)
+
+tabla_vif <- tibble(
+  variable = names(vif_raw),
+  vif = as.numeric(vif_raw)
+) %>%
+  mutate(vif_problematico = ifelse(vif > 5, "Sí", "No")) %>%
+  arrange(desc(vif))
+
+kable(tabla_vif,
+      digits = 3,
+      col.names = c("Variable", "VIF", "¿VIF > 5?"),
+      caption = "Diagnóstico de multicolinealidad (VIF)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+vars_vif_alto <- tabla_vif %>% filter(vif > 5) %>% pull(variable)
+
+if (length(vars_vif_alto) == 0) {
+  cat("No se detectaron variables con VIF > 5. Se mantienen todos los predictores seleccionados.\n")
+} else {
+  cat("Variables con VIF > 5:", paste(vars_vif_alto, collapse = ", "), "\n")
+  cat("Decisión: se mantienen temporalmente para no alterar la línea base; ")
+  cat("su posible eliminación se evaluará en selección de modelo (AIC/BIC) de la Entrega 2.\n")
+}
+```
+
+### Odds ratios e interpretación en lenguaje de negocio
+
+```{r odds-ratios}
+tabla_or <- broom::tidy(modelo_base) %>%
+  mutate(
+    odds_ratio = exp(estimate),
+    ci_low = exp(estimate - 1.96 * std.error),
+    ci_high = exp(estimate + 1.96 * std.error)
+  ) %>%
+  select(term, odds_ratio, ci_low, ci_high, p.value) %>%
+  mutate(significativa = ifelse(p.value < 0.05, "Sí", "No"))
+
+kable(tabla_or,
+      digits = 4,
+      col.names = c("Término", "Odds Ratio", "IC 2.5%", "IC 97.5%", "p-value", "¿Sig. 5%?"),
+      caption = "Odds ratios del modelo base") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r interpretar-3-or, results='asis'}
+top_or <- tabla_or %>%
+  filter(term != "(Intercept)") %>%
+  arrange(p.value) %>%
+  slice_head(n = 3)
+
+cat("Interpretación de al menos 3 odds ratios (lenguaje de negocio):\n\n")
+
+for (i in seq_len(nrow(top_or))) {
+  termino <- top_or$term[i]
+  or_i <- top_or$odds_ratio[i]
+
+  if (or_i >= 1) {
+    pct <- (or_i - 1) * 100
+    cat("- **", termino, "**: manteniendo las demás variables constantes, ",
+        "un aumento de 1 unidad en esta variable incrementa los odds de que la propiedad sea *cara* en aproximadamente ",
+        round(pct, 2), "% (OR = ", round(or_i, 3), ").\n", sep = "")
+  } else {
+    pct <- (1 - or_i) * 100
+    cat("- **", termino, "**: manteniendo las demás variables constantes, ",
+        "un aumento de 1 unidad en esta variable reduce los odds de que la propiedad sea *cara* en aproximadamente ",
+        round(pct, 2), "% (OR = ", round(or_i, 3), ").\n", sep = "")
+  }
+}
+```
+
+### Variables no significativas: decisión
+
+```{r vars-no-significativas}
+no_sig <- tabla_coef %>%
+  filter(term != "(Intercept)", p.value >= 0.05) %>%
+  arrange(desc(p.value))
+
+if (nrow(no_sig) == 0) {
+  cat("Todas las variables predictoras resultaron significativas al 5%.\n")
+} else {
+  kable(no_sig,
+        digits = 4,
+        col.names = c("Término", "Coef.", "Std. Error", "z-value", "p-value", "Sig."),
+        caption = "Variables no significativas (p >= 0.05)") %>%
+    kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+  cat("\nDecisión: se mantienen en el modelo base para preservar una referencia completa. ")
+}
+```
+
+### Exportacion del modelo base
+```{r exportar-modelo-base, eval=FALSE}
+save(modelo_base, vars_predictoras, formula_base, auc_cv_promedio, acc_train_05,
+     file = "modelo_base.RData")
+
+cat("modelo_base.RData exportado correctamente.\n")
+cat("Contiene: modelo_base, vars_predictoras, formula_base, auc_cv_promedio, acc_train_05\n")
+```
+
+---
+
+# Actividades 5 y 6
+## Actividad 5 — Evaluación en Test
+
+### Carga de prerequisitos
+
+```{r cargar-prereqs-actividad5}
+# train_data, test_data, modelo_base y vars_predictoras ya estan en el entorno
+# de knitr generados por los chunks de actividades previas en este mismo documento.
+cat("train:", nrow(train_data), "filas / test:", nrow(test_data), "filas\n")
+cat("Predictores:", length(vars_predictoras), "\n")
+cat("AUC CV (referencia):", round(auc_cv_promedio, 4), "\n")
+```
+
+### Predicciones en test con umbral 0.5
+
+```{r predicciones-test}
+# Preparar test sin NAs en los predictores usados por el modelo
+test_model <- test_data %>%
+  select(all_of(c("es_caro", vars_predictoras))) %>%
+  drop_na()
+
+cat("Filas de test usadas (tras drop_na):", nrow(test_model), "\n")
+
+# Probabilidades predichas y clases con umbral 0.5
+probs_test <- predict(modelo_base, newdata = test_model, type = "response")
+pred_test  <- ifelse(probs_test >= 0.5, 1L, 0L)
+```
+
+### Métricas en test
+
+```{r metricas-test}
+tp <- sum(pred_test == 1L & test_model$es_caro == 1L)
+tn <- sum(pred_test == 0L & test_model$es_caro == 0L)
+fp <- sum(pred_test == 1L & test_model$es_caro == 0L)
+fn <- sum(pred_test == 0L & test_model$es_caro == 1L)
+
+accuracy  <- (tp + tn) / nrow(test_model)
+precision <- tp / (tp + fp)
+recall    <- tp / (tp + fn)
+f1        <- 2 * precision * recall / (precision + recall)
+
+roc_obj <- pROC::roc(test_model$es_caro, probs_test, quiet = TRUE)
+auc_test <- as.numeric(pROC::auc(roc_obj))
+
+tabla_metricas_test <- tibble(
+  Métrica = c("Accuracy", "Precision", "Recall (Sensitivity)", "F1-Score", "AUC-ROC"),
+  Valor   = c(accuracy, precision, recall, f1, auc_test)
+)
+
+kable(tabla_metricas_test,
+      digits = 4,
+      col.names = c("Métrica", "Valor"),
+      caption = "Métricas del modelo base en el conjunto de test (umbral = 0.5)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### Curva ROC
+
+```{r curva-roc, fig.width=7, fig.height=5}
+roc_df <- data.frame(
+  fpr = 1 - roc_obj$specificities,
+  tpr = roc_obj$sensitivities
+)
+
+ggplot(roc_df, aes(x = fpr, y = tpr)) +
+  geom_line(color = "#2196F3", linewidth = 1.2) +
+  geom_abline(linetype = "dashed", color = "grey60") +
+  annotate("text", x = 0.65, y = 0.15,
+           label = paste0("AUC = ", round(auc_test, 4)),
+           size = 5, color = "#1565C0", fontface = "bold") +
+  labs(
+    title = "Curva ROC - Modelo Logistico Base (conjunto de test)",
+    x = "Tasa de Falsos Positivos (1 - Specificity)",
+    y = "Tasa de Verdaderos Positivos (Sensitivity)"
+  ) +
+  theme_minimal()
+```
+
+La curva ROC se aleja claramente de la diagonal (clasificador aleatorio), lo que indica que el modelo tiene capacidad discriminativa real. Un AUC cercano a 1 refleja que el modelo logra separar bien propiedades caras de las no caras.
+
+### Comparación AUC en CV vs AUC en test
+
+```{r comparar-auc}
+tabla_auc_comp <- tibble(
+  Evaluación = c("CV 10-fold (train)", "Test set"),
+  AUC        = c(auc_cv_promedio, auc_test),
+  Diferencia = c(NA_real_, auc_cv_promedio - auc_test)
+)
+
+kable(tabla_auc_comp,
+      digits = 4,
+      col.names = c("Evaluación", "AUC", "Δ AUC (CV − Test)"),
+      caption = "Comparación AUC: validación cruzada vs conjunto de test") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r interpretacion-auc, results='asis'}
+delta <- auc_cv_promedio - auc_test
+
+if (abs(delta) <= 0.02) {
+  cat("> **Interpretación:** La diferencia entre el AUC de CV y el AUC en test es de",
+      round(abs(delta), 4), ", lo que está dentro del margen de variabilidad esperado.",
+      "No hay señales de overfitting: el modelo generaliza bien.\n")
+} else if (delta > 0.02) {
+  cat("> **Interpretación:** El AUC en CV supera al AUC en test por",
+      round(delta, 4), "puntos. Esta brecha sugiere cierto grado de overfitting:",
+      "el modelo se ajusta mejor a los datos de entrenamiento que a datos nuevos.\n")
+} else {
+  cat("> **Interpretación:** El AUC en test supera al de CV por",
+      round(abs(delta), 4), "puntos. El modelo generaliza correctamente.\n")
+}
+```
+
+---
+
+## Actividad 6 — Overfitting y Curvas de Aprendizaje
+
+Las curvas de aprendizaje miden cómo evoluciona el desempeño del modelo a medida que aumenta la cantidad de datos de entrenamiento disponibles. Se entrena el mismo modelo logístico con subconjuntos crecientes del `train_data` (del 10% al 100% en pasos del 10%) y se evalúa el accuracy tanto sobre ese subconjunto como sobre el `test_data` completo.
+
+```{r curvas-aprendizaje, cache=TRUE}
+# Preparar datos sin NAs para el loop
+train_curvas <- train_data %>%
+  select(all_of(c("es_caro", vars_predictoras))) %>%
+  drop_na()
+
+proporciones <- seq(0.10, 1.00, by = 0.10)
+
+resultados_curvas <- purrr::map_dfr(proporciones, function(prop) {
+  set.seed(SEED_GLOBAL)
+
+  n_filas <- floor(nrow(train_curvas) * prop)
+  idx     <- sample(seq_len(nrow(train_curvas)), size = n_filas)
+  subset  <- train_curvas[idx, ]
+
+  modelo_subset <- glm(formula_base, data = subset, family = binomial(link = "logit"))
+
+  # Accuracy en el subconjunto de entrenamiento
+  probs_sub <- predict(modelo_subset, newdata = subset, type = "response")
+  acc_train_sub <- mean(ifelse(probs_sub >= 0.5, 1L, 0L) == subset$es_caro)
+
+  # Accuracy en test completo
+  probs_test_sub <- predict(modelo_subset, newdata = test_model, type = "response")
+  acc_test_sub   <- mean(ifelse(probs_test_sub >= 0.5, 1L, 0L) == test_model$es_caro)
+
+  tibble(
+    proporcion  = prop,
+    n_filas     = n_filas,
+    acc_train   = acc_train_sub,
+    acc_test    = acc_test_sub
+  )
+})
+```
+
+```{r grafico-curvas-aprendizaje, fig.width=8, fig.height=5}
+curvas_long <- resultados_curvas %>%
+  pivot_longer(cols = c(acc_train, acc_test),
+               names_to  = "conjunto",
+               values_to = "accuracy") %>%
+  mutate(conjunto = ifelse(conjunto == "acc_train", "Train", "Test"))
+
+ggplot(curvas_long, aes(x = proporcion * 100, y = accuracy, color = conjunto)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c("Train" = "#F44336", "Test" = "#2196F3")) +
+  scale_x_continuous(breaks = seq(10, 100, by = 10), labels = function(x) paste0(x, "%")) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  labs(
+    title  = "Curvas de Aprendizaje - Modelo Logistico Base",
+    x      = "Porcentaje de datos de entrenamiento usados",
+    y      = "Accuracy",
+    color  = "Conjunto"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+
+```{r diagnostico-curvas, results='asis'}
+# Diagnóstico automático basado en el gap al 100% de datos
+gap_final       <- resultados_curvas$acc_train[10] - resultados_curvas$acc_test[10]
+acc_test_final  <- resultados_curvas$acc_test[10]
+acc_train_final <- resultados_curvas$acc_train[10]
+
+cat("**Accuracy en train al 100% de datos:**", round(acc_train_final, 4), "\n\n")
+cat("**Accuracy en test al 100% de datos:**", round(acc_test_final, 4), "\n\n")
+cat("**Gap train − test:**", round(gap_final, 4), "\n\n")
+
+if (gap_final > 0.05) {
+  cat("> **Diagnóstico: Overfitting.** El modelo rinde significativamente mejor en train que en test.",
+      "La brecha de", round(gap_final, 4), "sugiere que el modelo memoriza el conjunto de entrenamiento",
+      "en lugar de aprender patrones generalizables.",
+      "**Recomendación:** aplicar regularización (Lasso/Ridge) para penalizar la complejidad del modelo.\n")
+} else if (acc_test_final < 0.65 && gap_final <= 0.05) {
+  cat("> **Diagnóstico: Underfitting.** Ambas curvas convergen en valores de accuracy bajos.",
+      "El modelo no captura suficiente información del problema.",
+      "**Recomendación:** agregar variables más informativas o considerar modelos más flexibles.\n")
+} else {
+  cat("> **Diagnóstico: Comportamiento saludable.** Las curvas train y test se acercan progresivamente",
+      "a medida que aumentan los datos de entrenamiento, y la brecha final es pequeña (",
+      round(gap_final, 4), "). El modelo generaliza correctamente.",
+      "**Recomendación:** el modelo base es adecuado; se puede explorar regularización",
+      "leve para verificar si mejora la estabilidad.\n")
+}
+```
+
+### Tabla de resultados por proporción
+
+```{r tabla-curvas}
+kable(resultados_curvas %>%
+        mutate(proporcion = paste0(proporcion * 100, "%")) %>%
+        select(proporcion, n_filas, acc_train, acc_test),
+      digits = 4,
+      col.names = c("% datos train", "N filas", "Accuracy Train", "Accuracy Test"),
+      caption = "Evolución del accuracy por tamaño del subconjunto de entrenamiento") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### Exportación de objetos para Entrega 2
+
+```{r exportar-eval-test, eval=FALSE}
+save(probs_test, roc_obj, file = "eval_test.RData")
+
+cat("eval_test.RData exportado correctamente.\n")
+cat("Contiene: probs_test (probabilidades predichas en test), roc_obj (objeto ROC para Youden)\n")
+```
+
+---
