@@ -1066,5 +1066,227 @@ cat("**Error mas frecuente en modelo base:**", err_base, "\n\n")
 cat("**Error mas frecuente en modelo regularizado:**", err_reg, "\n\n")
 ```
 
-En el contexto de SmartStay, suele ser mas costoso no detectar una propiedad realmente cara (FN), porque se pierde oportunidad de aplicar estrategias premium y capturar ingresos altos.  
+En el contexto de SmartStay, suele ser mas costoso no detectar una propiedad realmente cara (FN), porque se pierde oportunidad de aplicar estrategias premium y capturar ingresos altos.
 Por ello, al comparar modelos conviene priorizar **Sensitivity/Recall** sin descuidar Precision para evitar una sobreclasificacion excesiva de propiedades no caras como caras.
+
+---
+
+## Actividad 9 — Ajuste de Umbral con Indice de Youden
+
+El umbral por defecto de 0.5 no necesariamente maximiza el desempeno del clasificador. El **indice de Youden** (J = Sensitivity + Specificity - 1) identifica el punto de la curva ROC que maximiza la suma de ambas tasas, ofreciendo el mejor balance entre deteccion de verdaderos positivos y rechazo de verdaderos negativos.
+
+```{r youden-umbral}
+# Usar el mejor modelo (base o regularizado segun Act 8)
+# probs_mejor_reg y probs_base_act7 ya estan en el entorno
+
+# Calcular curva ROC del mejor modelo regularizado
+roc_reg <- pROC::roc(y_test, probs_mejor_reg, quiet = TRUE)
+
+# Indice de Youden: maximizar sensitivity + specificity - 1
+youden_idx <- which.max(roc_reg$sensitivities + roc_reg$specificities - 1)
+umbral_youden <- roc_reg$thresholds[youden_idx]
+
+cat("Umbral optimo (Youden):", round(umbral_youden, 4), "\n")
+cat("Sensitivity en ese umbral:", round(roc_reg$sensitivities[youden_idx], 4), "\n")
+cat("Specificity en ese umbral:", round(roc_reg$specificities[youden_idx], 4), "\n")
+```
+
+```{r comparar-umbrales}
+eval_umbral_05 <- calcular_desempeno_binario(y_test, probs_mejor_reg, umbral = 0.5)
+eval_umbral_youden <- calcular_desempeno_binario(y_test, probs_mejor_reg, umbral = umbral_youden)
+
+tabla_umbrales <- bind_rows(
+  eval_umbral_05$metricas %>% mutate(Umbral = "0.50 (default)"),
+  eval_umbral_youden$metricas %>% mutate(Umbral = paste0(round(umbral_youden, 4), " (Youden)"))
+) %>%
+  select(Umbral, Accuracy, Sensitivity, Specificity, Precision, F1, AUC)
+
+kable(tabla_umbrales,
+      digits = 4,
+      caption = "Comparacion de umbrales: 0.5 vs optimo de Youden") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r matrices-confusion-youden}
+kable(eval_umbral_05$matriz,
+      caption = paste0("Matriz de confusion - Umbral 0.5 (Regularizado ", nombre_mejor_reg, ")")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+kable(eval_umbral_youden$matriz,
+      caption = paste0("Matriz de confusion - Umbral Youden ", round(umbral_youden, 4),
+                       " (Regularizado ", nombre_mejor_reg, ")")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r grafico-roc-youden}
+plot(roc_reg,
+     main = paste0("Curva ROC con umbral optimo de Youden\n(AUC = ",
+                   round(pROC::auc(roc_reg), 4), ")"),
+     col = "steelblue", lwd = 2)
+
+points(
+  x = 1 - roc_reg$specificities[youden_idx],
+  y = roc_reg$sensitivities[youden_idx],
+  col = "red", pch = 19, cex = 1.5
+)
+
+text(
+  x = 1 - roc_reg$specificities[youden_idx] + 0.05,
+  y = roc_reg$sensitivities[youden_idx] - 0.04,
+  labels = paste0("Youden\n(", round(umbral_youden, 3), ")"),
+  col = "red", cex = 0.85
+)
+```
+
+```{r analisis-youden, results='asis'}
+delta_sens <- eval_umbral_youden$metricas$Sensitivity - eval_umbral_05$metricas$Sensitivity
+delta_spec <- eval_umbral_youden$metricas$Specificity - eval_umbral_05$metricas$Specificity
+delta_f1   <- eval_umbral_youden$metricas$F1 - eval_umbral_05$metricas$F1
+
+cat("**Cambio en Sensitivity:**", round(delta_sens, 4), "\n\n")
+cat("**Cambio en Specificity:**", round(delta_spec, 4), "\n\n")
+cat("**Cambio en F1:**", round(delta_f1, 4), "\n\n")
+```
+
+En SmartStay, reducir los falsos negativos (propiedades caras clasificadas como baratas) es prioritario porque implica perder oportunidades de estrategia premium.
+Si el umbral de Youden aumenta la Sensitivity a costa de algo de Specificity, la perdida de precision en las clasicas no-caras es tolerable: el negocio prefiere sobreclasificar ligeramente hacia "caro" antes que dejar escapar propiedades de alto valor.
+Por ello, el umbral de Youden es el recomendado para el modelo en produccion de SmartStay.
+
+---
+
+## Actividad 10 — Seleccion de Modelo con AIC y BIC
+
+AIC y BIC penalizan la complejidad del modelo para evitar el sobreajuste. BIC impone una penalizacion mas fuerte por numero de parametros, favoreciendo modelos mas parsimoniosos. Se comparan tres variantes: modelo completo, modelo reducido (solo variables significativas) y modelo seleccionado por stepwise con BIC.
+
+```{r preparar-datos-glm}
+# Recuperar datos y formula del modelo base
+load("splits.RData")
+load("modelo_base.RData")
+
+# Variables predictoras utilizadas en el modelo base
+vars_modelo <- names(coef(modelo_base))
+vars_modelo <- vars_modelo[vars_modelo != "(Intercept)"]
+
+# Extraer nombres de columnas originales (sin dummies) desde train_data
+# Se reconstruye la formula a partir del modelo base
+formula_completa <- formula(modelo_base)
+```
+
+```{r modelo-completo-aic}
+# Modelo completo: mismo que modelo_base
+modelo_completo <- modelo_base
+
+aic_completo <- AIC(modelo_completo)
+bic_completo <- BIC(modelo_completo)
+n_params_completo <- length(coef(modelo_completo))
+
+cat("Modelo completo — AIC:", round(aic_completo, 2),
+    "| BIC:", round(bic_completo, 2),
+    "| Parametros:", n_params_completo, "\n")
+```
+
+```{r modelo-reducido}
+# Modelo reducido: solo variables con p-value < 0.05 en el modelo completo
+summary_base <- summary(modelo_base)
+coefs_df <- as.data.frame(summary_base$coefficients)
+coefs_df$variable <- rownames(coefs_df)
+
+vars_significativas <- coefs_df %>%
+  filter(`Pr(>|z|)` < 0.05, variable != "(Intercept)") %>%
+  pull(variable)
+
+if (length(vars_significativas) == 0) {
+  cat("No hay variables con p < 0.05; se usa el modelo completo como reducido.\n")
+  modelo_reducido <- modelo_completo
+} else {
+  formula_reducida <- as.formula(
+    paste("es_caro ~", paste(vars_significativas, collapse = " + "))
+  )
+  modelo_reducido <- glm(formula_reducida,
+                         data = train_data,
+                         family = binomial(link = "logit"))
+}
+
+aic_reducido <- AIC(modelo_reducido)
+bic_reducido <- BIC(modelo_reducido)
+n_params_reducido <- length(coef(modelo_reducido))
+
+cat("Modelo reducido — AIC:", round(aic_reducido, 2),
+    "| BIC:", round(bic_reducido, 2),
+    "| Parametros:", n_params_reducido, "\n")
+```
+
+```{r modelo-stepwise-bic}
+# Modelo stepwise con penalizacion BIC (k = log(n))
+n_train <- nrow(train_data)
+
+modelo_stepwise <- step(
+  modelo_completo,
+  direction = "both",
+  k = log(n_train),
+  trace = 0
+)
+
+aic_stepwise <- AIC(modelo_stepwise)
+bic_stepwise <- BIC(modelo_stepwise)
+n_params_stepwise <- length(coef(modelo_stepwise))
+
+cat("Modelo stepwise BIC — AIC:", round(aic_stepwise, 2),
+    "| BIC:", round(bic_stepwise, 2),
+    "| Parametros:", n_params_stepwise, "\n")
+```
+
+```{r tabla-aic-bic}
+# AUC en test para cada modelo
+probs_completo_test  <- predict(modelo_completo,  newdata = test_data, type = "response")
+probs_reducido_test  <- predict(modelo_reducido,  newdata = test_data, type = "response")
+probs_stepwise_test  <- predict(modelo_stepwise,  newdata = test_data, type = "response")
+
+auc_completo  <- as.numeric(pROC::auc(pROC::roc(y_test, probs_completo_test,  quiet = TRUE)))
+auc_reducido  <- as.numeric(pROC::auc(pROC::roc(y_test, probs_reducido_test,  quiet = TRUE)))
+auc_stepwise  <- as.numeric(pROC::auc(pROC::roc(y_test, probs_stepwise_test,  quiet = TRUE)))
+
+tabla_seleccion <- tibble(
+  Modelo       = c("Completo", "Reducido (p<0.05)", "Stepwise BIC"),
+  Parametros   = c(n_params_completo, n_params_reducido, n_params_stepwise),
+  AIC          = c(aic_completo, aic_reducido, aic_stepwise),
+  BIC          = c(bic_completo, bic_reducido, bic_stepwise),
+  AUC_test     = c(auc_completo, auc_reducido, auc_stepwise)
+)
+
+kable(tabla_seleccion,
+      digits = 2,
+      caption = "Comparacion de modelos por AIC, BIC y AUC en test") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(which.min(tabla_seleccion$BIC), bold = TRUE, background = "#d4edda")
+```
+
+```{r grafico-aic-bic}
+tabla_long <- tabla_seleccion %>%
+  select(Modelo, AIC, BIC) %>%
+  pivot_longer(cols = c(AIC, BIC), names_to = "Criterio", values_to = "Valor")
+
+ggplot(tabla_long, aes(x = Modelo, y = Valor, fill = Criterio)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = round(Valor, 1)),
+            position = position_dodge(width = 0.9),
+            vjust = -0.4, size = 3) +
+  labs(title = "Comparacion AIC y BIC por modelo",
+       x = NULL, y = "Valor del criterio") +
+  scale_fill_manual(values = c("AIC" = "steelblue", "BIC" = "tomato")) +
+  theme_minimal()
+```
+
+```{r modelo-ganador, results='asis'}
+idx_ganador <- which.min(tabla_seleccion$BIC)
+nombre_ganador <- tabla_seleccion$Modelo[idx_ganador]
+
+cat("**Modelo seleccionado por BIC:**", nombre_ganador, "\n\n")
+cat("**Parametros:**", tabla_seleccion$Parametros[idx_ganador], "\n\n")
+cat("**BIC:**", round(tabla_seleccion$BIC[idx_ganador], 2), "\n\n")
+cat("**AUC en test:**", round(tabla_seleccion$AUC_test[idx_ganador], 4), "\n\n")
+```
+
+BIC penaliza mas fuertemente la cantidad de parametros que AIC, por lo que tiende a seleccionar el modelo mas parsimonioso entre los candidatos.
+En SmartStay, un modelo con menos variables es preferible si mantiene un AUC competitivo: es mas facil de mantener, interpretar y auditar para el equipo de negocio.
+El modelo ganador por BIC representa el mejor equilibrio entre capacidad predictiva y complejidad, y es el recomendado para reemplazar al modelo base en produccion.
