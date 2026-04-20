@@ -5,15 +5,15 @@ header-includes:
   - \usepackage{longtable}
   - \usepackage{booktabs}
 output:
-  pdf_document:
-    toc: true
-    latex_engine: xelatex
   html_document:
     toc: true
     toc_float: true
     theme: flatly
     highlight: tango
     df_print: paged
+  pdf_document:
+    toc: true
+    latex_engine: xelatex
 ---
 
 ```{r setup, include=FALSE}
@@ -33,6 +33,7 @@ library(pROC)
 library(car)
 library(broom)
 library(glmnet)
+library(nnet)
 ```
 
 ```{r seed-global}
@@ -1237,10 +1238,10 @@ cat("Modelo stepwise BIC — AIC:", round(aic_stepwise, 2),
 ```
 
 ```{r tabla-aic-bic}
-# AUC en test para cada modelo
-probs_completo_test  <- predict(modelo_completo,  newdata = test_data, type = "response")
-probs_reducido_test  <- predict(modelo_reducido,  newdata = test_data, type = "response")
-probs_stepwise_test  <- predict(modelo_stepwise,  newdata = test_data, type = "response")
+# Usar test_reg (sin NAs) para que coincida con y_test
+probs_completo_test  <- predict(modelo_completo,  newdata = test_reg, type = "response")
+probs_reducido_test  <- predict(modelo_reducido,  newdata = test_reg, type = "response")
+probs_stepwise_test  <- predict(modelo_stepwise,  newdata = test_reg, type = "response")
 
 auc_completo  <- as.numeric(pROC::auc(pROC::roc(y_test, probs_completo_test,  quiet = TRUE)))
 auc_reducido  <- as.numeric(pROC::auc(pROC::roc(y_test, probs_reducido_test,  quiet = TRUE)))
@@ -1290,3 +1291,402 @@ cat("**AUC en test:**", round(tabla_seleccion$AUC_test[idx_ganador], 4), "\n\n")
 BIC penaliza mas fuertemente la cantidad de parametros que AIC, por lo que tiende a seleccionar el modelo mas parsimonioso entre los candidatos.
 En SmartStay, un modelo con menos variables es preferible si mantiene un AUC competitivo: es mas facil de mantener, interpretar y auditar para el equipo de negocio.
 El modelo ganador por BIC representa el mejor equilibrio entre capacidad predictiva y complejidad, y es el recomendado para reemplazar al modelo base en produccion.
+
+---
+
+# Actividades 11 y 12
+
+## Actividad 11 — Modelo Multiclase
+
+La regresion logistica multinomial extiende el modelo binario al caso de mas de dos clases. Se usa la funcion `multinom` del paquete `nnet`, que entrena un modelo one-vs-reference para cada clase no de referencia.
+
+### Carga de prerequisitos
+
+```{r cargar-prereqs-act11}
+library(nnet)
+
+if (!exists("train_data") || !exists("test_data")) {
+  load("splits.RData")
+}
+
+if (!exists("vars_predictoras")) {
+  load("modelo_base.RData")
+}
+
+cat("Train:", nrow(train_data), "filas | Test:", nrow(test_data), "filas\n")
+cat("Predictores:", length(vars_predictoras), "\n")
+cat("Niveles originales de categoria_precio:", paste(levels(train_data$categoria_precio), collapse = ", "), "\n")
+```
+
+### Clase de referencia
+
+La clase de referencia del modelo multinomial es la primera en orden **alfabetico**: **`caro`** (caro < economico < medio). Los coeficientes del modelo se interpretan como el cambio en el log-odds de pertenecer a `economico` o `medio` *versus* pertenecer a `caro`. Esto facilita la interpretacion de negocio: se mide cuanto mas probable es que una propiedad sea economica o media respecto a ser cara.
+
+```{r preparar-datos-multiclase}
+# Releveling para que "caro" sea la clase de referencia (primera alfabeticamente)
+train_multi <- train_data %>%
+  select(all_of(c("categoria_precio", vars_predictoras))) %>%
+  drop_na() %>%
+  mutate(categoria_precio = relevel(factor(categoria_precio), ref = "caro"))
+
+test_multi <- test_data %>%
+  select(all_of(c("categoria_precio", vars_predictoras))) %>%
+  drop_na() %>%
+  mutate(categoria_precio = relevel(factor(categoria_precio), ref = "caro"))
+
+cat("Clase de referencia:", levels(train_multi$categoria_precio)[1], "\n")
+cat("Filas train (sin NA):", nrow(train_multi), "\n")
+cat("Filas test (sin NA):", nrow(test_multi), "\n")
+```
+
+### Entrenamiento del modelo multinomial
+
+```{r entrenar-multinom}
+set.seed(SEED_GLOBAL)
+
+formula_multi <- as.formula(
+  paste("categoria_precio ~", paste(vars_predictoras, collapse = " + "))
+)
+
+modelo_multi <- multinom(
+  formula_multi,
+  data = train_multi,
+  maxit = 300,
+  trace = FALSE
+)
+
+cat("Modelo multinomial entrenado correctamente.\n")
+cat("Clases predichas:", paste(levels(fitted(modelo_multi)), collapse = ", "), "\n")
+```
+
+### Predicciones en test
+
+```{r predicciones-multiclase}
+pred_multi <- predict(modelo_multi, newdata = test_multi, type = "class")
+probs_multi <- predict(modelo_multi, newdata = test_multi, type = "probs")
+
+cat("Distribucion de predicciones en test:\n")
+print(table(pred_multi))
+```
+
+### Matriz de confusion multiclase
+
+```{r confusion-multiclase}
+conf_multi <- table(
+  Real     = test_multi$categoria_precio,
+  Predicho = pred_multi
+)
+
+kable(conf_multi,
+      caption = "Matriz de confusion multiclase (test)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r accuracy-por-clase}
+# Accuracy global
+acc_global_multi <- sum(diag(conf_multi)) / sum(conf_multi)
+
+# Accuracy por clase (recall = TP / total real de esa clase)
+acc_por_clase <- diag(conf_multi) / rowSums(conf_multi)
+
+# Precision por clase (TP / total predicho de esa clase)
+prec_por_clase <- diag(conf_multi) / colSums(conf_multi)
+
+# F1 por clase
+f1_por_clase <- 2 * acc_por_clase * prec_por_clase /
+                (acc_por_clase + prec_por_clase)
+
+tabla_metricas_multi <- tibble(
+  Clase     = names(acc_por_clase),
+  Recall    = acc_por_clase,
+  Precision = prec_por_clase,
+  F1        = f1_por_clase
+)
+
+kable(tabla_metricas_multi,
+      digits = 4,
+      col.names = c("Clase", "Recall (Acc. por clase)", "Precision", "F1"),
+      caption = paste0("Metricas por clase — Accuracy global: ",
+                       round(acc_global_multi, 4))) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r grafico-confusion-multiclase, fig.width=6, fig.height=5}
+conf_df <- as.data.frame(conf_multi) %>%
+  rename(Real = Real, Predicho = Predicho, N = Freq)
+
+ggplot(conf_df, aes(x = Predicho, y = Real, fill = N)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = N), size = 5, fontface = "bold") +
+  scale_fill_gradient(low = "#E3F2FD", high = "#1565C0") +
+  labs(
+    title = "Matriz de confusion — Modelo Multinomial",
+    x = "Clase Predicha",
+    y = "Clase Real",
+    fill = "N"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+```{r analisis-multiclase, results='asis'}
+# Clase con peor recall
+peor_clase <- names(which.min(acc_por_clase))
+mejor_clase <- names(which.max(acc_por_clase))
+
+cat("**Accuracy global del modelo multinomial:**", round(acc_global_multi, 4), "\n\n")
+cat("**Clase mejor clasificada:**", mejor_clase,
+    "(Recall =", round(max(acc_por_clase), 4), ")\n\n")
+cat("**Clase con mas errores:**", peor_clase,
+    "(Recall =", round(min(acc_por_clase), 4), ")\n\n")
+
+# Identificar confusion dominante: donde se equivoca mas
+errores <- conf_multi
+diag(errores) <- 0
+max_error_idx <- which(errores == max(errores), arr.ind = TRUE)
+clase_real_err <- rownames(errores)[max_error_idx[1, 1]]
+clase_pred_err <- colnames(errores)[max_error_idx[1, 2]]
+
+cat("**Confusion mas frecuente:** propiedades realmente `", clase_real_err,
+    "` clasificadas como `", clase_pred_err, "` (N = ", max(errores), ").\n\n", sep = "")
+
+cat("Esta confusion es esperable: las clases adyacentes en precio (economico/medio o medio/caro) ",
+    "comparten caracteristicas similares, por lo que la frontera de decision es mas difusa que ",
+    "en las clases extremas. El modelo distingue mejor entre `caro` y `economico` que entre clases vecinas.\n")
+```
+
+---
+
+## Actividad 12 — Comparacion con Otros Algoritmos
+
+Se comparan cinco algoritmos sobre el problema **binario** (`es_caro`) bajo el mismo esquema de validacion cruzada de 10 pliegues, con el seed global para reproducibilidad. Se usa `caret` como framework unificado.
+
+**Algoritmos evaluados:**
+
+| # | Algoritmo | Metodo caret |
+|---|-----------|-------------|
+| 1 | Regresion Logistica | `glm` |
+| 2 | Arbol de Decision | `rpart` |
+| 3 | Random Forest | `rf` |
+| 4 | Naive Bayes | `nb` |
+| 5 | KNN | `knn` |
+
+### Preparacion de datos
+
+```{r preparar-datos-act12}
+if (!exists("train_data")) load("splits.RData")
+if (!exists("vars_predictoras")) load("modelo_base.RData")
+
+# Dataset binario sin NAs, target como factor para caret
+train_bin <- train_data %>%
+  select(all_of(c("es_caro", vars_predictoras))) %>%
+  drop_na() %>%
+  mutate(es_caro = factor(ifelse(es_caro == 1, "caro", "no_caro"),
+                          levels = c("caro", "no_caro")))
+
+test_bin <- test_data %>%
+  select(all_of(c("es_caro", vars_predictoras))) %>%
+  drop_na() %>%
+  mutate(es_caro = factor(ifelse(es_caro == 1, "caro", "no_caro"),
+                          levels = c("caro", "no_caro")))
+
+cat("Filas train:", nrow(train_bin), "| test:", nrow(test_bin), "\n")
+cat("Balance en train:\n")
+print(prop.table(table(train_bin$es_caro)))
+```
+
+### Configuracion de validacion cruzada
+
+```{r ctrl-cv-act12}
+ctrl_comp <- caret::trainControl(
+  method          = "cv",
+  number          = 10,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+formula_comp <- as.formula(
+  paste("es_caro ~", paste(vars_predictoras, collapse = " + "))
+)
+```
+
+### Entrenamiento de los 5 modelos
+
+```{r entrenar-glm-comp}
+set.seed(SEED_GLOBAL)
+fit_glm <- caret::train(
+  formula_comp, data = train_bin,
+  method    = "glm",
+  family    = binomial(),
+  trControl = ctrl_comp,
+  metric    = "ROC"
+)
+cat("GLM listo. AUC CV:", round(fit_glm$results$ROC, 4), "\n")
+```
+
+```{r entrenar-rpart-comp}
+set.seed(SEED_GLOBAL)
+fit_rpart <- caret::train(
+  formula_comp, data = train_bin,
+  method    = "rpart",
+  trControl = ctrl_comp,
+  metric    = "ROC",
+  tuneLength = 10
+)
+cat("rpart listo. AUC CV:", round(max(fit_rpart$results$ROC), 4), "\n")
+```
+
+```{r entrenar-rf-comp}
+set.seed(SEED_GLOBAL)
+fit_rf <- caret::train(
+  formula_comp, data = train_bin,
+  method    = "rf",
+  trControl = ctrl_comp,
+  metric    = "ROC",
+  tuneLength = 3,
+  ntree      = 100
+)
+cat("RF listo. AUC CV:", round(max(fit_rf$results$ROC), 4), "\n")
+```
+
+```{r entrenar-nb-comp}
+set.seed(SEED_GLOBAL)
+fit_nb <- caret::train(
+  formula_comp, data = train_bin,
+  method    = "nb",
+  trControl = ctrl_comp,
+  metric    = "ROC"
+)
+cat("Naive Bayes listo. AUC CV:", round(max(fit_nb$results$ROC), 4), "\n")
+```
+
+```{r entrenar-knn-comp}
+# Se evaluan 4 valores de k: 5, 11, 21, 31
+set.seed(SEED_GLOBAL)
+fit_knn <- caret::train(
+  formula_comp, data = train_bin,
+  method    = "knn",
+  trControl = ctrl_comp,
+  metric    = "ROC",
+  tuneGrid  = data.frame(k = c(5, 11, 21, 31))
+)
+mejor_k <- fit_knn$bestTune$k
+cat("KNN listo. Mejor k:", mejor_k,
+    "| AUC CV:", round(max(fit_knn$results$ROC), 4), "\n")
+```
+
+### Tabla comparativa de metricas en test
+
+```{r tabla-comparacion-algoritmos}
+# Funcion auxiliar: calcular AUC, Accuracy y F1 en test
+evaluar_en_test <- function(modelo, test_df, nombre) {
+  probs  <- predict(modelo, newdata = test_df, type = "prob")[, "caro"]
+  preds  <- predict(modelo, newdata = test_df)
+  y_real <- test_df$es_caro
+
+  tp <- sum(preds == "caro"    & y_real == "caro")
+  tn <- sum(preds == "no_caro" & y_real == "no_caro")
+  fp <- sum(preds == "caro"    & y_real == "no_caro")
+  fn <- sum(preds == "no_caro" & y_real == "caro")
+
+  acc  <- (tp + tn) / nrow(test_df)
+  prec <- ifelse((tp + fp) == 0, NA_real_, tp / (tp + fp))
+  rec  <- ifelse((tp + fn) == 0, NA_real_, tp / (tp + fn))
+  f1   <- ifelse(is.na(prec) | is.na(rec) | (prec + rec) == 0,
+                 NA_real_, 2 * prec * rec / (prec + rec))
+  auc  <- as.numeric(pROC::auc(pROC::roc(
+    as.integer(y_real == "caro"), probs, quiet = TRUE)))
+
+  tibble(Modelo = nombre, AUC = auc, Accuracy = acc, F1 = f1)
+}
+
+tabla_comp <- bind_rows(
+  evaluar_en_test(fit_glm,   test_bin, "Regresion Logistica"),
+  evaluar_en_test(fit_rpart, test_bin, "Arbol de Decision"),
+  evaluar_en_test(fit_rf,    test_bin, "Random Forest"),
+  evaluar_en_test(fit_nb,    test_bin, "Naive Bayes"),
+  evaluar_en_test(fit_knn,   test_bin, paste0("KNN (k=", mejor_k, ")"))
+) %>%
+  arrange(desc(AUC))
+
+kable(tabla_comp,
+      digits = 4,
+      caption = "Comparacion de algoritmos en test (ordenado por AUC)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(1, bold = TRUE, background = "#d4edda")
+```
+
+### Grafico comparativo con intervalos de confianza (CV)
+
+```{r grafico-comparacion-cv, fig.width=8, fig.height=5}
+resultados_cv <- caret::resamples(list(
+  "Logistica"   = fit_glm,
+  "Arbol"       = fit_rpart,
+  "RandomForest"= fit_rf,
+  "NaiveBayes"  = fit_nb,
+  "KNN"         = fit_knn
+))
+
+# Extraer AUC (ROC) por fold para cada modelo
+auc_cv_df <- as.data.frame(resultados_cv$values) %>%
+  select(ends_with("~ROC")) %>%
+  pivot_longer(
+    cols      = everything(),
+    names_to  = "Modelo",
+    values_to = "AUC"
+  ) %>%
+  mutate(Modelo = gsub("~ROC", "", Modelo))
+
+ggplot(auc_cv_df, aes(x = reorder(Modelo, AUC, FUN = median), y = AUC)) +
+  geom_boxplot(aes(fill = Modelo), show.legend = FALSE, alpha = 0.7) +
+  geom_jitter(width = 0.1, alpha = 0.4, size = 1.5, color = "grey30") +
+  coord_flip() +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Distribucion del AUC por algoritmo (CV 10-fold)",
+    subtitle = "Cada punto es un fold; la caja muestra mediana e IQR",
+    x = NULL,
+    y = "AUC (ROC)"
+  ) +
+  theme_minimal()
+```
+
+### Analisis y recomendacion final
+
+```{r recomendacion-final, results='asis'}
+ganador <- tabla_comp$Modelo[1]
+auc_ganador <- tabla_comp$AUC[1]
+auc_logistica <- tabla_comp %>% filter(Modelo == "Regresion Logistica") %>% pull(AUC)
+
+cat("**Modelo con mayor AUC en test:**", ganador, "(AUC =", round(auc_ganador, 4), ")\n\n")
+
+cat("**AUC de Regresion Logistica en test:**", round(auc_logistica, 4), "\n\n")
+
+diferencia <- auc_ganador - auc_logistica
+
+if (diferencia <= 0.01) {
+  cat("La diferencia de AUC entre el mejor modelo y la regresion logistica es de solo",
+      round(diferencia, 4), "puntos.\n\n")
+  cat("**Recomendacion para SmartStay:** se recomienda mantener la **Regresion Logistica** ",
+      "en produccion. Aunque el modelo ganador obtiene marginalmente mas AUC, la diferencia ",
+      "no justifica la mayor complejidad: la regresion logistica es interpretable (coeficientes ",
+      "con significado de negocio directo), facil de auditar y explicar a stakeholders no tecnicos, ",
+      "y tiene menor costo computacional para re-entrenamiento periodico.\n\n")
+} else {
+  cat("El modelo ganador supera a la regresion logistica por", round(diferencia, 4),
+      "puntos de AUC, una diferencia operacionalmente relevante.\n\n")
+  cat("**Recomendacion para SmartStay:** se recomienda el **", ganador,
+      "** en produccion. La ganancia en capacidad predictiva justifica ",
+      "la mayor complejidad, especialmente si el equipo puede monitorear ",
+      "el modelo con herramientas de explicabilidad (SHAP, importancia de variables).\n\n", sep = "")
+}
+
+cat("**Trade-off interpretabilidad vs performance:** los modelos de tipo caja negra ",
+    "(Random Forest) suelen superar a la regresion logistica en AUC, pero pierden ",
+    "la capacidad de dar explicaciones directas por variable. Para SmartStay, donde ",
+    "el equipo de negocio necesita entender por que una propiedad es clasificada como cara, ",
+    "la interpretabilidad tiene valor real. Un enfoque pragmatico es usar la Regresion ",
+    "Logistica regularizada como modelo de produccion y el Random Forest como referencia ",
+    "de techo de rendimiento.\n")
+```
